@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import time
 from typing import Any, Callable, Dict, Optional
@@ -145,6 +146,11 @@ class ClaudeAgentSession:
         _cli = shutil.which("claude")
         if _cli:
             opts_kwargs["cli_path"] = _cli
+        # Strip empty ANTHROPIC_API_KEY — Hermes's .env often sets it to ""
+        # which overrides Claude Code's own OAuth credentials in the subprocess.
+        clean_env = {k: v for k, v in os.environ.items()
+                     if not (k in ("ANTHROPIC_API_KEY",) and not v)}
+        opts_kwargs["env"] = clean_env
         if self._model:
             opts_kwargs["model"] = self._model
         if self._cwd:
@@ -154,11 +160,10 @@ class ClaudeAgentSession:
         if self._session_id:
             opts_kwargs["resume"] = self._session_id
         if system_prompt:
-            opts_kwargs["system_prompt"] = {
-                "type": "preset",
-                "preset": "claude_code",
-                "append": system_prompt,
-            }
+            # Use Hermes's system prompt directly instead of appending to
+            # Claude Code's preset — the combined size would exceed the API
+            # limit (Claude Code's own prompt is ~100K+ tokens).
+            opts_kwargs["system_prompt"] = system_prompt
 
         options = ClaudeAgentOptions(**opts_kwargs)
 
@@ -172,6 +177,11 @@ class ClaudeAgentSession:
 
         async def _exchange():
             nonlocal result_msg, api_calls, interrupted, last_reasoning
+
+            logger.info("Claude SDK query: cli_path=%s cwd=%s model=%s resume=%s prompt_len=%d system_len=%d",
+                        opts_kwargs.get("cli_path"), opts_kwargs.get("cwd"), opts_kwargs.get("model"),
+                        opts_kwargs.get("resume"), len(user_message),
+                        len(str(opts_kwargs.get("system_prompt", ""))))
 
             async for message in claude_query(prompt=user_message, options=options):
                 if interrupt_check and interrupt_check():
