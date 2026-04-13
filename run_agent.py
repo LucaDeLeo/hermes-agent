@@ -7788,12 +7788,28 @@ class AIAgent:
         owns the tool loop; Hermes fires its callbacks and returns the
         standard result dict so the TUI / gateway layer works unchanged.
         """
-        # System prompt: cached base + ephemeral overlay (personalities, etc.)
-        if self._cached_system_prompt is None:
-            self._cached_system_prompt = self._build_system_prompt()
-        effective_system = self._cached_system_prompt or ""
+        # Pass only the lightweight context (SOUL.md, AGENTS.md, memory,
+        # user profile) — not the full Hermes system prompt which includes
+        # tool guidance and skills listings that Claude Code already handles.
+        _ctx_parts = []
+        try:
+            from agent.prompt_builder import build_context_files_prompt
+            _ctx = build_context_files_prompt(cwd=os.getcwd())
+            if _ctx:
+                _ctx_parts.append(_ctx)
+        except Exception:
+            pass
+        if self._memory_store:
+            for section in ("memory", "user"):
+                try:
+                    _mem = self._memory_store.format_for_system_prompt(section)
+                    if _mem:
+                        _ctx_parts.append(_mem)
+                except Exception:
+                    pass
         if self.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
+            _ctx_parts.append(self.ephemeral_system_prompt)
+        effective_system = "\n\n".join(p.strip() for p in _ctx_parts if p.strip()) or None
 
         result = self._claude_agent_session.send_message(
             user_message,
