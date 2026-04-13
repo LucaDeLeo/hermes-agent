@@ -339,12 +339,12 @@ async def get_status():
 
 
 @app.get("/api/sessions")
-async def get_sessions(limit: int = 20, offset: int = 0):
+async def get_sessions(limit: int = 20, offset: int = 0, include_children: bool = False):
     try:
         from hermes_state import SessionDB
         db = SessionDB()
         try:
-            sessions = db.list_sessions_rich(limit=limit, offset=offset)
+            sessions = db.list_sessions_rich(limit=limit, offset=offset, include_children=include_children)
             total = db.session_count()
             now = time.time()
             for s in sessions:
@@ -1484,6 +1484,75 @@ async def delete_session_endpoint(session_id: str):
         return {"ok": True}
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Chat endpoint — talk to Hermes from the dashboard
+# ---------------------------------------------------------------------------
+
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = None
+
+
+@app.post("/api/chat")
+async def chat_endpoint(body: ChatRequest):
+    """Stream a chat response from Hermes via SSE.
+
+    Reuses the shared chat runner (same agent pipeline as the API server)
+    so all non-obvious edge cases are handled: delta-None filtering,
+    tool-progress as custom SSE events, session rotation on compression,
+    disconnect interruption.
+    """
+    from fastapi.responses import StreamingResponse
+
+    try:
+        from gateway.platforms.chat_runner import (
+            create_chat_agent,
+            make_stream_callbacks,
+            run_agent_async,
+            sse_event_stream,
+        )
+    except ImportError as e:
+        raise HTTPException(status_code=500, detail=f"Chat runner unavailable: {e}")
+
+    conversation_history = []
+    session_db = None
+    if body.session_id:
+        try:
+            from hermes_state import SessionDB
+            session_db = SessionDB()
+            conversation_history = session_db.get_messages_as_conversation(body.session_id)
+        except Exception as exc:
+            _log.warning("Failed to load conversation history for %s: %s", body.session_id, exc)
+
+    on_delta, on_tool_progress, stream_q = make_stream_callbacks()
+
+    agent = create_chat_agent(
+        platform="dashboard",
+        session_id=body.session_id,
+        stream_delta_callback=on_delta,
+        tool_progress_callback=on_tool_progress,
+        session_db=session_db,
+    )
+
+    agent_ref = [None]
+    agent_task = asyncio.create_task(run_agent_async(
+        agent,
+        user_message=body.message,
+        conversation_history=conversation_history,
+        agent_ref=agent_ref,
+    ))
+
+    return StreamingResponse(
+        sse_event_stream(stream_q, agent_task, agent_ref),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

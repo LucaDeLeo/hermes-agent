@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef } from "react";
-import { Activity, BarChart3, Clock, FileText, KeyRound, MessageSquare, Package, Settings } from "lucide-react";
+import { Activity, BarChart3, Clock, FileText, KeyRound, MessageCircle, MessageSquare, Package, Settings } from "lucide-react";
 import StatusPage from "@/pages/StatusPage";
 import ConfigPage from "@/pages/ConfigPage";
 import EnvPage from "@/pages/EnvPage";
 import SessionsPage from "@/pages/SessionsPage";
+import ChatPage from "@/pages/ChatPage";
 import LogsPage from "@/pages/LogsPage";
 import AnalyticsPage from "@/pages/AnalyticsPage";
 import CronPage from "@/pages/CronPage";
@@ -12,6 +13,7 @@ import SkillsPage from "@/pages/SkillsPage";
 const NAV_ITEMS = [
   { id: "status", label: "Status", icon: Activity },
   { id: "sessions", label: "Sessions", icon: MessageSquare },
+  { id: "chat", label: "Chat", icon: MessageCircle },
   { id: "analytics", label: "Analytics", icon: BarChart3 },
   { id: "logs", label: "Logs", icon: FileText },
   { id: "cron", label: "Cron", icon: Clock },
@@ -25,6 +27,7 @@ type PageId = (typeof NAV_ITEMS)[number]["id"];
 const PAGE_COMPONENTS: Record<PageId, React.FC> = {
   status: StatusPage,
   sessions: SessionsPage,
+  chat: ChatPage,
   analytics: AnalyticsPage,
   logs: LogsPage,
   cron: CronPage,
