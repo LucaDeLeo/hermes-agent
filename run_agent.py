@@ -868,6 +868,7 @@ class AIAgent:
         self._is_native_anthropic_for_harness = False
         self._harness_messages: list = []
         self._harness_sdk_session_id: Optional[str] = None
+        self._mcp_context: Optional[dict] = None
 
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
@@ -1137,7 +1138,10 @@ class AIAgent:
             try:
                 self._create_harness()
                 if not self.quiet_mode:
-                    print("⚡ Claude Code harness active — tools delegated to Claude Code")
+                    _mcp_status = ""
+                    if self._claude_agent_session and self._claude_agent_session._mcp_server_config:
+                        _mcp_status = " + MCP tools"
+                    print(f"⚡ Claude Code harness active — tools delegated to Claude Code{_mcp_status}")
             except ImportError:
                 logger.warning("model.harness=claude_code but claude-agent-sdk not installed; using Messages API")
             except Exception as exc:
@@ -1167,8 +1171,9 @@ class AIAgent:
                     self._memory_store.load_from_disk()
             except Exception:
                 pass  # Memory is optional -- don't break agent init
-        
 
+        if self._mcp_context is not None and self._memory_store:
+            self._mcp_context["memory_store"] = self._memory_store
 
         # Memory provider plugin (external — one at a time, alongside built-in)
         # Reads memory.provider from config to select which plugin to activate.
@@ -3060,15 +3065,42 @@ class AIAgent:
 
         Resumes the previous SDK session if one was captured, so gateway
         flows that recreate AIAgent per message keep Claude Code context.
+        Also builds an in-process MCP server that exposes Hermes-unique
+        tools (browser, vision, cron, memory, todo, etc.) to Claude Code.
         Raises on failure — callers handle their own error reporting.
         """
         from agent.claude_agent_adapter import ClaudeAgentSession
+
+        # Build in-process MCP server exposing Hermes-unique tools.
+        # The context dict is mutable — late-initialized stores (memory)
+        # are injected after __init__ continues past this point.
+        mcp_server_config = None
+        self._mcp_context = None
+        try:
+            from tools.mcp_tools_server import create_hermes_tools_server
+            self._mcp_context = {
+                "task_id": self.session_id,
+                "todo_store": self._todo_store,
+                "memory_store": None,  # set after memory init
+                "session_db": self._session_db,
+                "session_id": self.session_id,
+                "user_task": None,
+                "parent_agent": self,
+                "enabled_tools": list(self.valid_tool_names) if self.valid_tool_names else None,
+            }
+            mcp_server_config = create_hermes_tools_server(self._mcp_context)
+        except ImportError:
+            logger.debug("claude_agent_sdk not available for MCP tools server")
+        except Exception as exc:
+            logger.warning("Failed to build Hermes MCP tools server: %s", exc, exc_info=True)
+
         session = ClaudeAgentSession(
             model=self.model,
             cwd=os.getcwd(),
             permission_mode="acceptEdits",
             max_turns=self.max_iterations,
             resume_session_id=self._harness_sdk_session_id,
+            mcp_server_config=mcp_server_config,
         )
         session.connect()
         self._claude_agent_session = session

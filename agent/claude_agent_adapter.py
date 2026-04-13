@@ -79,6 +79,7 @@ class ClaudeAgentSession:
         max_turns: Optional[int] = None,
         allowed_tools: Optional[list] = None,
         resume_session_id: Optional[str] = None,
+        mcp_server_config=None,
     ):
         if not _check_sdk():
             raise ImportError(
@@ -94,6 +95,7 @@ class ClaudeAgentSession:
             "Read", "Write", "Edit", "Bash", "Glob", "Grep",
             "WebSearch", "WebFetch",
         ]
+        self._mcp_server_config = mcp_server_config
         self._session_id: Optional[str] = resume_session_id
         self._connected = True  # no connect step needed for query()
 
@@ -138,9 +140,18 @@ class ClaudeAgentSession:
         # Build fresh options each turn so system_prompt changes take effect
         opts_kwargs: Dict[str, Any] = {
             "permission_mode": self._permission_mode,
-            "allowed_tools": self._allowed_tools,
             "include_partial_messages": True,
         }
+        if self._mcp_server_config is not None:
+            opts_kwargs["mcp_servers"] = {"hermes-tools": self._mcp_server_config}
+            # allowed_tools pre-approves tools so Claude Code doesn't prompt
+            # for permission (prompts go to the subprocess stdin, not the TUI).
+            # Include both Claude Code built-ins and MCP tool names.
+            from tools.mcp_tools_server import _get_hermes_mcp_tools
+            mcp_names = [f"mcp__hermes-tools__{t}" for t in _get_hermes_mcp_tools()]
+            opts_kwargs["allowed_tools"] = self._allowed_tools + mcp_names
+        else:
+            opts_kwargs["allowed_tools"] = self._allowed_tools
         # Use the system-installed claude CLI, not the SDK's bundled one
         import shutil
         _cli = shutil.which("claude")
