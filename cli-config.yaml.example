@@ -44,6 +44,14 @@ model:
   #
   # Can also be overridden with --provider flag or HERMES_INFERENCE_PROVIDER env var.
   provider: "auto"
+
+  # Harness mode (Anthropic provider only):
+  #   "messages_api"  - Direct Anthropic Messages API calls (default)
+  #   "claude_code"   - Delegate to Claude Code via the Claude Agent SDK.
+  #                     Claude Code owns the tool loop (Read, Edit, Bash, etc.)
+  #                     and reuses its own authentication. Hermes becomes the UI.
+  #                     Requires: pip install 'hermes-agent[claude-agent]'
+  # harness: "claude_code"
   
   # API configuration (falls back to OPENROUTER_API_KEY env var)
   # api_key: "your-key-here"  # Uncomment to set here instead of .env

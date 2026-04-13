@@ -1884,6 +1884,8 @@ class HermesCLI:
             model_short = model_short[:-5]
         if len(model_short) > 26:
             model_short = f"{model_short[:23]}..."
+        if getattr(agent, "_claude_agent_session", None) is not None:
+            model_short = f"{model_short} [CC]"
 
         elapsed_seconds = max(0.0, (datetime.now() - self.session_start).total_seconds())
         snapshot = {

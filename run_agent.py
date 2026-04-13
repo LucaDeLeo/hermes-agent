@@ -864,6 +864,10 @@ class AIAgent:
         # access for Codex Responses API streaming.
         self._anthropic_client = None
         self._is_anthropic_oauth = False
+        self._claude_agent_session = None
+        self._is_native_anthropic_for_harness = False
+        self._harness_messages: list = []
+        self._harness_sdk_session_id: Optional[str] = None
 
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
@@ -885,6 +889,11 @@ class AIAgent:
                 print(f"🤖 AI Agent initialized with model: {self.model} (Anthropic native)")
                 if effective_key and len(effective_key) > 12:
                     print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
+
+            # Harness flag is read later from _agent_cfg (loaded once at ~line 1149).
+            # We store provider nativeness so the deferred init can use it.
+            self._is_native_anthropic_for_harness = _is_native_anthropic
+
         else:
             if api_key and base_url:
                 # Explicit credentials from CLI/gateway — construct directly.
@@ -1114,12 +1123,25 @@ class AIAgent:
         from tools.todo_tool import TodoStore
         self._todo_store = TodoStore()
         
-        # Load config once for memory, skills, and compression sections
+        # Load config once for memory, skills, compression, and harness
         try:
             from hermes_cli.config import load_config as _load_agent_config
             _agent_cfg = _load_agent_config()
         except Exception:
             _agent_cfg = {}
+
+        # Claude Code harness — delegate to Claude Agent SDK
+        if self._get_harness_mode(_agent_cfg) == "claude_code" and self._is_native_anthropic_for_harness:
+            if not self._harness_sdk_session_id:
+                self._harness_sdk_session_id = self._load_sdk_session_id()
+            try:
+                self._create_harness()
+                if not self.quiet_mode:
+                    print("⚡ Claude Code harness active — tools delegated to Claude Code")
+            except ImportError:
+                logger.warning("model.harness=claude_code but claude-agent-sdk not installed; using Messages API")
+            except Exception as exc:
+                logger.warning("Claude Code harness init failed: %s; using Messages API", exc)
 
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
@@ -1508,6 +1530,18 @@ class AIAgent:
         # Context engine reset (works for both built-in compressor and plugins)
         if hasattr(self, "context_compressor") and self.context_compressor:
             self.context_compressor.on_session_reset()
+
+        # Tear down and recreate Claude Code harness.  Restore the SDK
+        # session_id from the DB for the (possibly new) Hermes session so
+        # /resume and session-switch flows reconnect to the right Claude
+        # Code conversation instead of starting fresh.
+        if self._claude_agent_session is not None:
+            self._teardown_harness()
+            self._harness_sdk_session_id = self._load_sdk_session_id()
+            try:
+                self._create_harness()
+            except Exception as exc:
+                logger.debug("Harness re-init after session reset failed: %s", exc)
     
     def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
         """Switch the model/provider in-place for a live agent.
@@ -1540,6 +1574,11 @@ class AIAgent:
         self.api_mode = api_mode
         if api_key:
             self.api_key = api_key
+
+        self._teardown_harness()
+        # Clear SDK session_id so a stale Claude Code session isn't resumed
+        # after turns on a different provider.
+        self._harness_sdk_session_id = None
 
         # ── Build new client ──
         if api_mode == "anthropic_messages":
@@ -1581,6 +1620,15 @@ class AIAgent:
             ("openrouter" in (self.base_url or "").lower() and "claude" in new_model.lower())
             or is_native_anthropic
         )
+
+        # ── Re-create Claude Code harness if still on native Anthropic ──
+        if is_native_anthropic:
+            try:
+                from hermes_cli.config import load_config as _lc_sw
+                if self._get_harness_mode(_lc_sw()) == "claude_code":
+                    self._create_harness()
+            except Exception as exc:
+                logger.debug("Harness re-init after model switch failed: %s", exc)
 
         # ── Update context compressor ──
         if hasattr(self, "context_compressor") and self.context_compressor:
@@ -2985,6 +3033,57 @@ class AIAgent:
             except Exception:
                 pass
     
+    @staticmethod
+    def _get_harness_mode(config: dict) -> str:
+        """Read ``model.harness`` from a loaded config dict."""
+        model_sec = config.get("model", {})
+        if not isinstance(model_sec, dict):
+            return ""
+        return (model_sec.get("harness") or "").strip().lower()
+
+    def _load_sdk_session_id(self) -> Optional[str]:
+        """Read the Claude SDK session_id from the session DB, or None."""
+        if not self._session_db or not self.session_id:
+            return None
+        try:
+            sess = self._session_db.get_session(self.session_id)
+            if sess and sess.get("model_config"):
+                mc = json.loads(sess["model_config"])
+                if isinstance(mc, dict):
+                    return mc.get("claude_sdk_session_id")
+        except Exception:
+            pass
+        return None
+
+    def _create_harness(self):
+        """Create and connect a Claude Agent SDK session.
+
+        Resumes the previous SDK session if one was captured, so gateway
+        flows that recreate AIAgent per message keep Claude Code context.
+        Raises on failure — callers handle their own error reporting.
+        """
+        from agent.claude_agent_adapter import ClaudeAgentSession
+        session = ClaudeAgentSession(
+            model=self.model,
+            cwd=os.getcwd(),
+            permission_mode="acceptEdits",
+            max_turns=self.max_iterations,
+            resume_session_id=self._harness_sdk_session_id,
+        )
+        session.connect()
+        self._claude_agent_session = session
+
+    def _teardown_harness(self):
+        """Disconnect and discard the Claude Agent SDK session."""
+        session = self._claude_agent_session
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+            self._claude_agent_session = None
+            self._harness_messages = []
+
     def close(self) -> None:
         """Release all resources held by this agent instance.
 
@@ -3042,6 +3141,9 @@ class AIAgent:
                 self.client = None
         except Exception:
             pass
+
+        # 6. Close Claude Agent SDK session (harness mode)
+        self._teardown_harness()
 
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
         """
@@ -7671,6 +7773,104 @@ class AIAgent:
 
         return final_response
 
+    # -----------------------------------------------------------------
+    # Claude Code harness: delegate entire turn to Claude Agent SDK
+    # -----------------------------------------------------------------
+
+    def _run_claude_code_conversation(
+        self,
+        user_message: str,
+        original_user_message: str = "",
+    ) -> Dict[str, Any]:
+        """Run a conversation turn via the Claude Agent SDK.
+
+        Called when ``model.harness: claude_code`` is active.  Claude Code
+        owns the tool loop; Hermes fires its callbacks and returns the
+        standard result dict so the TUI / gateway layer works unchanged.
+        """
+        # System prompt: cached base + ephemeral overlay (personalities, etc.)
+        if self._cached_system_prompt is None:
+            self._cached_system_prompt = self._build_system_prompt()
+        effective_system = self._cached_system_prompt or ""
+        if self.ephemeral_system_prompt:
+            effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
+
+        result = self._claude_agent_session.send_message(
+            user_message,
+            system_prompt=effective_system,
+            thinking_callback=self.thinking_callback,
+            stream_delta_callback=self.stream_delta_callback,
+            tool_progress_callback=self.tool_progress_callback,
+            tool_complete_callback=self.tool_complete_callback,
+            status_callback=self.status_callback,
+            interrupt_check=lambda: self._interrupt_requested,
+        )
+
+        self.session_input_tokens += result.get("input_tokens", 0)
+        self.session_output_tokens += result.get("output_tokens", 0)
+        self.session_cache_read_tokens += result.get("cache_read_tokens", 0)
+        self.session_cache_write_tokens += result.get("cache_write_tokens", 0)
+        self.session_total_tokens += result.get("total_tokens", 0)
+        self.session_estimated_cost_usd += result.get("estimated_cost_usd", 0.0)
+
+        final_response = result.get("final_response")
+        interrupted = result.get("interrupted", False)
+        completed = result.get("completed", False)
+
+        # Capture SDK session_id for resume across fresh AIAgent instances.
+        # Persisted to the session DB so it survives process restarts.
+        sdk_sid = result.get("session_id")
+        if sdk_sid and sdk_sid != self._harness_sdk_session_id:
+            self._harness_sdk_session_id = sdk_sid
+            if self._session_db and self.session_id:
+                try:
+                    self._session_db.patch_model_config(
+                        self.session_id,
+                        {"claude_sdk_session_id": sdk_sid},
+                    )
+                except Exception:
+                    pass
+
+        # Append to cumulative list so _persist_session sees a growing
+        # list across turns (required by _last_flushed_db_idx tracking).
+        self._harness_messages.append({"role": "user", "content": original_user_message or user_message})
+        if final_response:
+            self._harness_messages.append({"role": "assistant", "content": final_response})
+
+        if self.save_trajectories:
+            try:
+                self._save_trajectory(self._harness_messages, user_message, completed)
+            except Exception:
+                pass
+
+        if self.persist_session:
+            try:
+                self._persist_session(self._harness_messages, None)
+            except Exception:
+                pass
+
+        if final_response and not interrupted:
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+                _invoke_hook(
+                    "post_llm_call",
+                    session_id=self.session_id,
+                    user_message=original_user_message or user_message,
+                    assistant_response=final_response,
+                    conversation_history=list(self._harness_messages),
+                    model=self.model,
+                    platform=getattr(self, "platform", None) or "",
+                )
+            except Exception as exc:
+                logger.warning("post_llm_call hook failed: %s", exc)
+
+        self.clear_interrupt()
+
+        # Override adapter's single-turn messages with the cumulative list
+        # so CLI/gateway callers get the full conversation history.
+        result["messages"] = list(self._harness_messages)
+        return result
+
     def run_conversation(
         self,
         user_message: str,
@@ -7782,6 +7982,12 @@ class AIAgent:
         # recover the todo state from the most recent todo tool response in history)
         if conversation_history and not self._todo_store.has_items():
             self._hydrate_todo_store(conversation_history)
+
+        # Seed harness message history from conversation_history so that
+        # trajectories and post_llm_call hooks see the full session, not
+        # just turns handled by the current process instance.
+        if conversation_history and not self._harness_messages:
+            self._harness_messages = list(conversation_history)
         
         # Prefill messages (few-shot priming) are injected at API-call time only,
         # never stored in the messages list. This keeps them ephemeral: they won't
@@ -7960,6 +8166,31 @@ class AIAgent:
                 _plugin_user_context = "\n\n".join(_ctx_parts)
         except Exception as exc:
             logger.warning("pre_llm_call hook failed: %s", exc)
+
+        if self._claude_agent_session is not None:
+            # Inject plugin context and memory prefetch into the user message
+            # (mirrors the normal path's injection at API-call time).
+            _injections = []
+            if self._memory_manager:
+                try:
+                    _query = original_user_message if isinstance(original_user_message, str) else ""
+                    _prefetch = self._memory_manager.prefetch_all(_query) or ""
+                    if _prefetch:
+                        from agent.prompt_builder import build_memory_context_block
+                        _fenced = build_memory_context_block(_prefetch)
+                        if _fenced:
+                            _injections.append(_fenced)
+                except Exception:
+                    pass
+            if _plugin_user_context:
+                _injections.append(_plugin_user_context)
+            _effective_user_msg = user_message
+            if _injections:
+                _effective_user_msg = user_message + "\n\n" + "\n\n".join(_injections)
+            return self._run_claude_code_conversation(
+                user_message=_effective_user_msg,
+                original_user_message=original_user_message,
+            )
 
         # Main conversation loop
         api_call_count = 0

@@ -409,6 +409,34 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def patch_model_config(self, session_id: str, patch: Dict[str, Any]) -> None:
+        """Merge *patch* into the existing model_config JSON for a session.
+
+        Creates the session row (via INSERT OR IGNORE) if it doesn't exist
+        yet, so the UPDATE is never a silent no-op.
+        """
+        def _do(conn):
+            # Backfill row if create_session() failed at startup
+            conn.execute(
+                "INSERT OR IGNORE INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+                (session_id, "cli", time.time()),
+            )
+            row = conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            existing: dict = {}
+            if row and row["model_config"]:
+                try:
+                    existing = json.loads(row["model_config"])
+                except (json.JSONDecodeError, TypeError):
+                    existing = {}
+            existing.update(patch)
+            conn.execute(
+                "UPDATE sessions SET model_config = ? WHERE id = ?",
+                (json.dumps(existing), session_id),
+            )
+        self._execute_write(_do)
+
     def update_token_counts(
         self,
         session_id: str,
