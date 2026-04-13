@@ -146,11 +146,12 @@ class ClaudeAgentSession:
         _cli = shutil.which("claude")
         if _cli:
             opts_kwargs["cli_path"] = _cli
-        # Strip empty ANTHROPIC_API_KEY — Hermes's .env often sets it to ""
-        # which overrides Claude Code's own OAuth credentials in the subprocess.
-        clean_env = {k: v for k, v in os.environ.items()
-                     if not (k in ("ANTHROPIC_API_KEY",) and not v)}
-        opts_kwargs["env"] = clean_env
+        # Strip empty ANTHROPIC_API_KEY from the process env — Hermes's .env
+        # often sets it to "" which overrides Claude Code's own OAuth creds
+        # in the subprocess.  Done once at the process level because the SDK
+        # inherits os.environ; the opts_kwargs["env"] dict is additive.
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            os.environ.pop("ANTHROPIC_API_KEY", None)
         if self._model:
             opts_kwargs["model"] = self._model
         if self._cwd:
