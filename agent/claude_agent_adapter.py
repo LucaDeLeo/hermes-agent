@@ -1,13 +1,13 @@
 """Claude Agent SDK adapter — runs Claude Code as the LLM backend.
 
 When ``model.harness: claude_code`` is set in the Hermes config, this module
-bridges the Claude Agent SDK's async ``ClaudeSDKClient`` into Hermes's
-synchronous ``AIAgent.run_conversation`` call.  Claude Code owns the tool
-loop (Read, Edit, Bash, …); Hermes maps streamed events to its callbacks.
+bridges the Claude Agent SDK's async ``query()`` into Hermes's synchronous
+``AIAgent.run_conversation`` call.  Claude Code owns the tool loop (Read,
+Edit, Bash, …); Hermes maps streamed events to its callbacks.
 
-Uses a dedicated daemon-thread event loop (not model_tools._run_async)
-because ClaudeSDKClient starts persistent background tasks during connect()
-that require the loop to stay running between calls.
+Uses ``query()`` per turn (not ``ClaudeSDKClient``) so that the system prompt
+can be updated each turn.  Session continuity across turns is maintained via
+the SDK's ``resume`` parameter.
 """
 
 from __future__ import annotations
@@ -36,9 +36,8 @@ def _check_sdk():
 
 
 # ---------------------------------------------------------------------------
-# Persistent event loop for the SDK's long-lived subprocess connection.
-# A single daemon thread runs loop.run_forever(); callers submit coroutines
-# via run_coroutine_threadsafe and block on the future.
+# Persistent event loop — a single daemon thread runs loop.run_forever();
+# callers submit coroutines via run_coroutine_threadsafe and block.
 # ---------------------------------------------------------------------------
 
 _loop: Optional[asyncio.AbstractEventLoop] = None
@@ -63,7 +62,12 @@ def _run_sync(coro):
 
 
 class ClaudeAgentSession:
-    """Wraps ``ClaudeSDKClient`` for use inside Hermes's synchronous agent."""
+    """Wraps Claude Agent SDK ``query()`` for use inside Hermes's sync agent.
+
+    Each ``send_message`` call invokes ``query()`` with the current system
+    prompt and ``resume=<previous_session_id>`` so Claude Code sees the full
+    conversation history.
+    """
 
     def __init__(
         self,
@@ -81,54 +85,24 @@ class ClaudeAgentSession:
                 "Install it with:  pip install 'hermes-agent[claude-agent]'"
             )
 
-        from claude_agent_sdk import ClaudeAgentOptions
-
-        opts_kwargs: Dict[str, Any] = {
-            "permission_mode": permission_mode,
-            "include_partial_messages": True,
-        }
-        if model:
-            opts_kwargs["model"] = model
-        if cwd:
-            opts_kwargs["cwd"] = cwd
-        if max_turns:
-            opts_kwargs["max_turns"] = max_turns
-        if resume_session_id:
-            opts_kwargs["resume"] = resume_session_id
-        if allowed_tools:
-            opts_kwargs["allowed_tools"] = allowed_tools
-        else:
-            opts_kwargs["allowed_tools"] = [
-                "Read", "Write", "Edit", "Bash", "Glob", "Grep",
-                "WebSearch", "WebFetch",
-            ]
-
-        self._options = ClaudeAgentOptions(**opts_kwargs)
-        self._client = None
-        self._session_id: Optional[str] = None
-        self._connected = False
+        self._model = model
+        self._cwd = cwd
+        self._permission_mode = permission_mode
+        self._max_turns = max_turns
+        self._allowed_tools = allowed_tools or [
+            "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+            "WebSearch", "WebFetch",
+        ]
+        self._session_id: Optional[str] = resume_session_id
+        self._connected = True  # no connect step needed for query()
 
     def connect(self):
-        if self._connected:
-            return
-        from claude_agent_sdk import ClaudeSDKClient
-
-        async def _connect():
-            self._client = ClaudeSDKClient(options=self._options)
-            await self._client.connect()
-
-        _run_sync(_connect())
-        self._connected = True
-        logger.info("Claude Agent SDK client connected")
+        """No-op — query() doesn't need a persistent connection."""
+        pass
 
     def close(self):
-        if self._client and self._connected:
-            try:
-                _run_sync(self._client.disconnect())
-            except Exception:
-                pass
-            self._connected = False
-            self._client = None
+        """No-op — query() is stateless per call."""
+        self._connected = False
 
     def send_message(
         self,
@@ -149,6 +123,8 @@ class ClaudeAgentSession:
         - tool_complete_callback(tool_call_id, function_name, function_args, function_result)
         """
         from claude_agent_sdk import (
+            query as claude_query,
+            ClaudeAgentOptions,
             AssistantMessage,
             ResultMessage,
             SystemMessage,
@@ -158,8 +134,28 @@ class ClaudeAgentSession:
             ToolResultBlock,
         )
 
-        if system_prompt and self._client:
-            self._options.append_system_prompt = system_prompt
+        # Build fresh options each turn so system_prompt changes take effect
+        opts_kwargs: Dict[str, Any] = {
+            "permission_mode": self._permission_mode,
+            "allowed_tools": self._allowed_tools,
+            "include_partial_messages": True,
+        }
+        if self._model:
+            opts_kwargs["model"] = self._model
+        if self._cwd:
+            opts_kwargs["cwd"] = self._cwd
+        if self._max_turns:
+            opts_kwargs["max_turns"] = self._max_turns
+        if self._session_id:
+            opts_kwargs["resume"] = self._session_id
+        if system_prompt:
+            opts_kwargs["system_prompt"] = {
+                "type": "preset",
+                "preset": "claude_code",
+                "append": system_prompt,
+            }
+
+        options = ClaudeAgentOptions(**opts_kwargs)
 
         final_text_parts: list[str] = []
         last_reasoning: Optional[str] = None
@@ -172,14 +168,8 @@ class ClaudeAgentSession:
         async def _exchange():
             nonlocal result_msg, api_calls, interrupted, last_reasoning
 
-            await self._client.query(user_message)
-
-            async for message in self._client.receive_response():
+            async for message in claude_query(prompt=user_message, options=options):
                 if interrupt_check and interrupt_check():
-                    try:
-                        await self._client.interrupt()
-                    except Exception:
-                        pass
                     interrupted = True
                     break
 
@@ -229,6 +219,9 @@ class ClaudeAgentSession:
             usage = result_msg.usage or {}
             if not final_response and result_msg.result:
                 final_response = result_msg.result
+            # Capture session_id from result if not already set from init message
+            if not self._session_id and hasattr(result_msg, "session_id"):
+                self._session_id = result_msg.session_id
 
         return {
             "final_response": final_response,
@@ -242,7 +235,7 @@ class ClaudeAgentSession:
             "partial": False,
             "interrupted": interrupted,
             "response_previewed": False,
-            "model": self._options.model or "",
+            "model": self._model or "",
             "provider": "anthropic",
             "base_url": "",
             "input_tokens": usage.get("input_tokens", 0),
@@ -264,8 +257,5 @@ class ClaudeAgentSession:
         }
 
     def interrupt(self):
-        if self._client and self._connected:
-            try:
-                _run_sync(self._client.interrupt())
-            except Exception as exc:
-                logger.debug("Interrupt failed: %s", exc)
+        """No-op for query() mode — interrupts are handled via interrupt_check callback."""
+        pass
