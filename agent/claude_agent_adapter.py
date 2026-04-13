@@ -140,6 +140,11 @@ class ClaudeAgentSession:
             "allowed_tools": self._allowed_tools,
             "include_partial_messages": True,
         }
+        # Use the system-installed claude CLI, not the SDK's bundled one
+        import shutil
+        _cli = shutil.which("claude")
+        if _cli:
+            opts_kwargs["cli_path"] = _cli
         if self._model:
             opts_kwargs["model"] = self._model
         if self._cwd:
