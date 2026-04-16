@@ -181,9 +181,13 @@ export default function ChatPage() {
     abortRef.current = controller;
 
     try {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      const token = window.__HERMES_SESSION_TOKEN__;
+      if (token) headers.Authorization = `Bearer ${token}`;
+
       const res = await fetch("/api/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({ message: text, session_id: currentSessionId }),
         signal: controller.signal,
       });
