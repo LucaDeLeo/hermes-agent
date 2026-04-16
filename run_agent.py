@@ -581,6 +581,7 @@ class AIAgent:
         tool_start_callback: callable = None,
         tool_complete_callback: callable = None,
         thinking_callback: callable = None,
+        thinking_delta_callback: callable = None,
         reasoning_callback: callable = None,
         clarify_callback: callable = None,
         step_callback: callable = None,
@@ -759,6 +760,7 @@ class AIAgent:
         self.tool_complete_callback = tool_complete_callback
         self.suppress_status_output = False
         self.thinking_callback = thinking_callback
+        self.thinking_delta_callback = thinking_delta_callback
         self.reasoning_callback = reasoning_callback
         self.clarify_callback = clarify_callback
         self.step_callback = step_callback
@@ -8366,6 +8368,7 @@ class AIAgent:
             user_message,
             system_prompt=effective_system,
             thinking_callback=self.thinking_callback,
+            thinking_delta_callback=self.thinking_delta_callback,
             stream_delta_callback=self.stream_delta_callback,
             tool_progress_callback=self.tool_progress_callback,
             tool_complete_callback=self.tool_complete_callback,

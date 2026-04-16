@@ -113,6 +113,7 @@ class ClaudeAgentSession:
         *,
         system_prompt: Optional[str] = None,
         thinking_callback: Optional[Callable] = None,
+        thinking_delta_callback: Optional[Callable] = None,
         stream_delta_callback: Optional[Callable] = None,
         tool_progress_callback: Optional[Callable] = None,
         tool_complete_callback: Optional[Callable] = None,
@@ -131,6 +132,7 @@ class ClaudeAgentSession:
             AssistantMessage,
             UserMessage,
             ResultMessage,
+            StreamEvent,
             SystemMessage,
             TextBlock,
             ThinkingBlock,
@@ -187,9 +189,14 @@ class ClaudeAgentSession:
         api_calls = 0
         interrupted = False
         start_time = time.monotonic()
+        # If StreamEvent text/thinking deltas fire, we've already delivered the
+        # content to the callbacks and must not re-deliver from AssistantMessage.
+        saw_text_delta = False
+        saw_thinking_delta = False
 
         async def _exchange():
             nonlocal result_msg, api_calls, interrupted, last_reasoning
+            nonlocal saw_text_delta, saw_thinking_delta
 
             logger.info("Claude SDK query: cli_path=%s cwd=%s model=%s resume=%s prompt_len=%d system_len=%d",
                         opts_kwargs.get("cli_path"), opts_kwargs.get("cwd"), opts_kwargs.get("model"),
@@ -214,17 +221,33 @@ class ClaudeAgentSession:
                         if sid:
                             self._session_id = sid
 
+                elif isinstance(message, StreamEvent):
+                    ev = message.event or {}
+                    if ev.get("type") == "content_block_delta":
+                        delta = ev.get("delta") or {}
+                        dtype = delta.get("type")
+                        if dtype == "text_delta":
+                            text = delta.get("text") or ""
+                            if text and stream_delta_callback:
+                                saw_text_delta = True
+                                stream_delta_callback(text)
+                        elif dtype == "thinking_delta":
+                            thinking = delta.get("thinking") or ""
+                            if thinking and thinking_delta_callback:
+                                saw_thinking_delta = True
+                                thinking_delta_callback(thinking)
+
                 elif isinstance(message, AssistantMessage):
                     api_calls += 1
                     for block in message.content:
                         if isinstance(block, TextBlock):
                             final_text_parts.append(block.text)
-                            if stream_delta_callback:
+                            if stream_delta_callback and not saw_text_delta:
                                 stream_delta_callback(block.text)
 
                         elif isinstance(block, ThinkingBlock):
                             last_reasoning = block.thinking
-                            if thinking_callback:
+                            if thinking_callback and not saw_thinking_delta:
                                 thinking_callback(block.thinking)
 
                         elif isinstance(block, ToolUseBlock):

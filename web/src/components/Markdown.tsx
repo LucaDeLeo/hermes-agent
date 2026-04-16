@@ -1,4 +1,7 @@
-import { useMemo } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
+import type { ThemedToken } from "shiki";
+import { resolveLang, tokenize, type TokenizedLine } from "@/lib/shiki";
+import { CopyButton } from "@/components/CopyButton";
 
 /**
  * Lightweight markdown renderer for LLM output.
@@ -124,14 +127,10 @@ function parseBlocks(text: string): BlockNode[] {
 /*  Block renderer                                                     */
 /* ------------------------------------------------------------------ */
 
-function Block({ block, highlightTerms }: { block: BlockNode; highlightTerms?: string[] }) {
+const Block = memo(function Block({ block, highlightTerms }: { block: BlockNode; highlightTerms?: string[] }) {
   switch (block.type) {
     case "code":
-      return (
-        <pre className="bg-secondary/60 border border-border px-3 py-2.5 text-xs font-mono leading-relaxed overflow-x-auto">
-          <code>{block.content}</code>
-        </pre>
-      );
+      return <CodeBlock lang={block.lang} content={block.content} />;
 
     case "heading": {
       const Tag = `h${Math.min(block.level, 4)}` as "h1" | "h2" | "h3" | "h4";
@@ -161,7 +160,7 @@ function Block({ block, highlightTerms }: { block: BlockNode; highlightTerms?: s
     case "paragraph":
       return <p><InlineContent text={block.content} highlightTerms={highlightTerms} /></p>;
   }
-}
+});
 
 /* ------------------------------------------------------------------ */
 /*  Inline parser + renderer                                           */
@@ -256,19 +255,98 @@ function InlineContent({ text, highlightTerms }: { text: string; highlightTerms?
   );
 }
 
+/* ------------------------------------------------------------------ */
+/*  Code block with syntax highlighting                                 */
+/* ------------------------------------------------------------------ */
+
+const FONT_STYLE_ITALIC = 1;
+const FONT_STYLE_BOLD = 2;
+const FONT_STYLE_UNDERLINE = 4;
+
+const CodeBlock = memo(function CodeBlock({ lang, content }: { lang: string; content: string }) {
+  const resolved = useMemo(() => resolveLang(lang), [lang]);
+  const [tokens, setTokens] = useState<TokenizedLine[] | null>(null);
+
+  useEffect(() => {
+    if (!resolved) {
+      setTokens(null);
+      return;
+    }
+    let cancelled = false;
+    // Debounce so streaming code blocks don't re-tokenize on every delta.
+    const handle = window.setTimeout(() => {
+      tokenize(content, resolved).then((res) => {
+        if (cancelled) return;
+        setTokens(res?.lines ?? null);
+      });
+    }, 150);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(handle);
+    };
+  }, [content, resolved]);
+
+  return (
+    <div className="group relative my-1">
+      <pre className="bg-[#22272e] border border-border px-3 py-2.5 text-xs font-mono leading-relaxed overflow-x-auto text-foreground">
+        <code>
+          {tokens ? (
+            tokens.map((line, i) => (
+              <LineTokens key={i} tokens={line.tokens} isLast={i === tokens.length - 1} />
+            ))
+          ) : (
+            content
+          )}
+        </code>
+      </pre>
+      {lang && (
+        <span className="absolute top-1.5 left-3 text-[0.6rem] font-mono uppercase tracking-wide text-muted-foreground/60 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+          {lang}
+        </span>
+      )}
+      <CopyButton
+        value={content}
+        className="absolute top-1.5 right-1.5 opacity-0 group-hover:opacity-100 transition-opacity"
+      />
+    </div>
+  );
+});
+
+function LineTokens({ tokens, isLast }: { tokens: ThemedToken[]; isLast: boolean }) {
+  return (
+    <>
+      {tokens.map((token, i) => {
+        const style: React.CSSProperties = {};
+        if (token.color) style.color = token.color;
+        if (token.fontStyle) {
+          if (token.fontStyle & FONT_STYLE_ITALIC) style.fontStyle = "italic";
+          if (token.fontStyle & FONT_STYLE_BOLD) style.fontWeight = "bold";
+          if (token.fontStyle & FONT_STYLE_UNDERLINE) style.textDecoration = "underline";
+        }
+        return (
+          <span key={i} style={style}>
+            {token.content}
+          </span>
+        );
+      })}
+      {!isLast && "\n"}
+    </>
+  );
+}
+
 /** Highlight search terms within a plain text string. */
 function HighlightedText({ text, terms }: { text: string; terms?: string[] }) {
   if (!terms || terms.length === 0) return <>{text}</>;
 
-  // Build a regex that matches any of the search terms (case-insensitive)
   const escaped = terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-  const regex = new RegExp(`(${escaped.join("|")})`, "gi");
-  const parts = text.split(regex);
+  const splitter = new RegExp(`(${escaped.join("|")})`, "gi");
+  const matcher = new RegExp(`^(?:${escaped.join("|")})$`, "i");
+  const parts = text.split(splitter);
 
   return (
     <>
       {parts.map((part, i) =>
-        regex.test(part) ? (
+        matcher.test(part) ? (
           <mark key={i} className="bg-warning/30 text-warning px-0.5">{part}</mark>
         ) : (
           <span key={i}>{part}</span>

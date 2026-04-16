@@ -35,6 +35,7 @@ def create_chat_agent(
     stream_delta_callback: Optional[Callable] = None,
     tool_progress_callback: Optional[Callable] = None,
     tool_complete_callback: Optional[Callable] = None,
+    thinking_delta_callback: Optional[Callable] = None,
     ephemeral_system_prompt: Optional[str] = None,
     session_db: Any = None,
 ) -> Any:
@@ -87,6 +88,7 @@ def create_chat_agent(
         stream_delta_callback=stream_delta_callback,
         tool_progress_callback=tool_progress_callback,
         tool_complete_callback=tool_complete_callback,
+        thinking_delta_callback=thinking_delta_callback,
         session_db=session_db,
         fallback_model=fallback_model,
     )
@@ -100,8 +102,8 @@ def create_chat_agent(
 _TOOL_RESULT_MAX_CHARS = 5000
 
 
-def make_stream_callbacks() -> Tuple[Callable, Callable, Callable, queue.Queue]:
-    """Create the (on_delta, on_tool_progress, on_tool_complete, stream_queue) quad.
+def make_stream_callbacks() -> Tuple[Callable, Callable, Callable, Callable, queue.Queue]:
+    """Create the (on_delta, on_tool_progress, on_tool_complete, on_thinking, stream_queue) quintuple.
 
     ``on_delta`` filters out ``None`` (the agent fires it to signal the
     CLI display to close its response box before tool execution, but SSE
@@ -112,6 +114,10 @@ def make_stream_callbacks() -> Tuple[Callable, Callable, Callable, queue.Queue]:
     Also forwards ``tool.completed`` events with duration/error status.
 
     ``on_tool_complete`` sends full tool input/output for expandable cards.
+
+    ``on_thinking`` forwards raw ``thinking_delta`` chunks from the SDK.
+    Wire it into ``thinking_delta_callback`` (not ``thinking_callback``) so
+    CLI kawaii-spinner status pings never reach the SSE stream.
     """
     stream_q: queue.Queue = queue.Queue()
 
@@ -152,7 +158,11 @@ def make_stream_callbacks() -> Tuple[Callable, Callable, Callable, queue.Queue]:
             "output": str(result)[:_TOOL_RESULT_MAX_CHARS],
         }))
 
-    return on_delta, on_tool_progress, on_tool_complete, stream_q
+    def on_thinking(text):
+        if isinstance(text, str) and text:
+            stream_q.put(("__thinking__", {"text": text}))
+
+    return on_delta, on_tool_progress, on_tool_complete, on_thinking, stream_q
 
 
 # ------------------------------------------------------------------
@@ -291,4 +301,6 @@ def _format_sse_item(item) -> bytes:
             return f"event: hermes.tool.completed\ndata: {json.dumps(payload)}\n\n".encode()
         elif tag == "__tool_result__":
             return f"event: hermes.tool.result\ndata: {json.dumps(payload)}\n\n".encode()
+        elif tag == "__thinking__":
+            return f"event: hermes.thinking\ndata: {json.dumps(payload)}\n\n".encode()
     return f"event: delta\ndata: {json.dumps({'text': item})}\n\n".encode()

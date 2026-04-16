@@ -1782,7 +1782,7 @@ async def chat_endpoint(body: ChatRequest):
     except Exception as exc:
         _log.warning("Failed to load conversation history for %s: %s", body.session_id, exc)
 
-    on_delta, on_tool_progress, on_tool_complete, stream_q = make_stream_callbacks()
+    on_delta, on_tool_progress, on_tool_complete, on_thinking, stream_q = make_stream_callbacks()
 
     agent = create_chat_agent(
         platform="dashboard",
@@ -1790,6 +1790,7 @@ async def chat_endpoint(body: ChatRequest):
         stream_delta_callback=on_delta,
         tool_progress_callback=on_tool_progress,
         tool_complete_callback=on_tool_complete,
+        thinking_delta_callback=on_thinking,
         session_db=session_db,
     )
 
