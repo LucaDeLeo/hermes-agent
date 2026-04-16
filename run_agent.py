@@ -3290,6 +3290,28 @@ class AIAgent:
             pass
         return None
 
+    def _resolve_harness_cwd(self) -> str:
+        """Resolve the working directory the Claude Code subprocess runs in.
+
+        Reads ``terminal.cwd`` from config (the user-configured workspace).
+        Falls back to ``os.getcwd()`` when unset, empty, or "." so existing
+        CLI invocations from a project directory keep their current behavior.
+
+        Claude Code refuses to operate in untrusted folders and exits with
+        a misleading auth error, so always resolving to an absolute path
+        the user has explicitly chosen prevents launch-dir surprises in
+        long-running gateways (dashboard, telegram, etc.).
+        """
+        try:
+            from hermes_cli.config import load_config as _load_cfg
+            terminal_cfg = (_load_cfg().get("terminal") or {})
+            configured = terminal_cfg.get("cwd")
+        except Exception:
+            configured = None
+        if not configured or configured == ".":
+            return os.getcwd()
+        return os.path.abspath(os.path.expanduser(str(configured)))
+
     def _create_harness(self):
         """Create and connect a Claude Agent SDK session.
 
@@ -3326,7 +3348,7 @@ class AIAgent:
 
         session = ClaudeAgentSession(
             model=self.model,
-            cwd=os.getcwd(),
+            cwd=self._resolve_harness_cwd(),
             permission_mode="acceptEdits",
             max_turns=self.max_iterations,
             resume_session_id=self._harness_sdk_session_id,
