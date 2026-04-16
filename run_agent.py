@@ -934,8 +934,9 @@ class AIAgent:
                     print(f"🤖 AI Agent initialized with model: {self.model} (Anthropic native)")
                     if effective_key and len(effective_key) > 12:
                         print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
-                # Harness flag is read later from _agent_cfg (loaded once at ~line 1149).
-                # We store provider nativeness so the deferred init can use it.
+                # Captured here because the harness init (later in __init__) needs
+                # to know whether the provider is native Anthropic, but _is_native_anthropic
+                # is scoped to this branch.
                 self._is_native_anthropic_for_harness = _is_native_anthropic
         elif self.api_mode == "bedrock_converse":
             # AWS Bedrock — uses boto3 directly, no OpenAI client needed.
