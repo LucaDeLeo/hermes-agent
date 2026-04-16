@@ -34,6 +34,7 @@ def create_chat_agent(
     session_id: Optional[str] = None,
     stream_delta_callback: Optional[Callable] = None,
     tool_progress_callback: Optional[Callable] = None,
+    tool_complete_callback: Optional[Callable] = None,
     ephemeral_system_prompt: Optional[str] = None,
     session_db: Any = None,
 ) -> Any:
@@ -85,6 +86,7 @@ def create_chat_agent(
         platform=platform,
         stream_delta_callback=stream_delta_callback,
         tool_progress_callback=tool_progress_callback,
+        tool_complete_callback=tool_complete_callback,
         session_db=session_db,
         fallback_model=fallback_model,
     )
@@ -95,8 +97,11 @@ def create_chat_agent(
 # Stream callback factory
 # ------------------------------------------------------------------
 
-def make_stream_callbacks() -> Tuple[Callable, Callable, queue.Queue]:
-    """Create the (on_delta, on_tool_progress, stream_queue) triple.
+_TOOL_RESULT_MAX_CHARS = 5000
+
+
+def make_stream_callbacks() -> Tuple[Callable, Callable, Callable, queue.Queue]:
+    """Create the (on_delta, on_tool_progress, on_tool_complete, stream_queue) quad.
 
     ``on_delta`` filters out ``None`` (the agent fires it to signal the
     CLI display to close its response box before tool execution, but SSE
@@ -104,6 +109,9 @@ def make_stream_callbacks() -> Tuple[Callable, Callable, queue.Queue]:
 
     ``on_tool_progress`` pushes tagged tuples for custom SSE events so
     tool markers are NOT stored in conversation history (see #6972).
+    Also forwards ``tool.completed`` events with duration/error status.
+
+    ``on_tool_complete`` sends full tool input/output for expandable cards.
     """
     stream_q: queue.Queue = queue.Queue()
 
@@ -112,23 +120,39 @@ def make_stream_callbacks() -> Tuple[Callable, Callable, queue.Queue]:
             stream_q.put(delta)
 
     def on_tool_progress(event_type, name, preview, args, **kwargs):
-        if event_type != "tool.started":
+        if name and name.startswith("_"):
             return
-        if name.startswith("_"):
-            return
-        try:
-            from agent.display import get_tool_emoji
-            emoji = get_tool_emoji(name)
-        except Exception:
-            emoji = "⚡"
-        label = preview or name
-        stream_q.put(("__tool_progress__", {
-            "tool": name,
-            "emoji": emoji,
-            "label": label,
+        if event_type == "tool.started":
+            try:
+                from agent.display import get_tool_emoji
+                emoji = get_tool_emoji(name)
+            except Exception:
+                emoji = "⚡"
+            payload = {
+                "tool": name,
+                "emoji": emoji,
+                "label": preview or name,
+            }
+            tool_call_id = kwargs.get("tool_call_id")
+            if tool_call_id:
+                payload["tool_call_id"] = tool_call_id
+            stream_q.put(("__tool_progress__", payload))
+        elif event_type == "tool.completed":
+            stream_q.put(("__tool_completed__", {
+                "tool": name,
+                "duration": kwargs.get("duration"),
+                "is_error": kwargs.get("is_error", False),
+            }))
+
+    def on_tool_complete(tool_call_id, name, args, result):
+        stream_q.put(("__tool_result__", {
+            "tool_call_id": tool_call_id or "",
+            "name": name or "",
+            "input": str(args)[:_TOOL_RESULT_MAX_CHARS],
+            "output": str(result)[:_TOOL_RESULT_MAX_CHARS],
         }))
 
-    return on_delta, on_tool_progress, stream_q
+    return on_delta, on_tool_progress, on_tool_complete, stream_q
 
 
 # ------------------------------------------------------------------
@@ -225,8 +249,12 @@ async def sse_event_stream(
         try:
             result, agent_usage = await agent_task
             usage = agent_usage or usage
-            session_id = result.get("session_id") or (
-                agent_ref[0].session_id if agent_ref and agent_ref[0] else None
+            # Prefer the Hermes session_id (used for DB lookups and history
+            # continuity) over result["session_id"] which may be the Claude
+            # SDK's internal session_id in harness mode.
+            session_id = (
+                (agent_ref[0].session_id if agent_ref and agent_ref[0] else None)
+                or result.get("session_id")
             )
         except Exception:
             pass
@@ -255,7 +283,12 @@ async def sse_event_stream(
 
 def _format_sse_item(item) -> bytes:
     """Format a single queue item as an SSE event."""
-    if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
-        return f"event: hermes.tool.progress\ndata: {json.dumps(item[1])}\n\n".encode()
-    else:
-        return f"event: delta\ndata: {json.dumps({'text': item})}\n\n".encode()
+    if isinstance(item, tuple) and len(item) == 2:
+        tag, payload = item
+        if tag == "__tool_progress__":
+            return f"event: hermes.tool.progress\ndata: {json.dumps(payload)}\n\n".encode()
+        elif tag == "__tool_completed__":
+            return f"event: hermes.tool.completed\ndata: {json.dumps(payload)}\n\n".encode()
+        elif tag == "__tool_result__":
+            return f"event: hermes.tool.result\ndata: {json.dumps(payload)}\n\n".encode()
+    return f"event: delta\ndata: {json.dumps({'text': item})}\n\n".encode()

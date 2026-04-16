@@ -129,6 +129,7 @@ class ClaudeAgentSession:
             query as claude_query,
             ClaudeAgentOptions,
             AssistantMessage,
+            UserMessage,
             ResultMessage,
             SystemMessage,
             TextBlock,
@@ -200,6 +201,13 @@ class ClaudeAgentSession:
                     interrupted = True
                     break
 
+                # Debug: log all message types to understand the SDK protocol
+                msg_type = type(message).__name__
+                block_types = []
+                if hasattr(message, "content") and isinstance(message.content, list):
+                    block_types = [type(b).__name__ for b in message.content]
+                logger.debug("SDK message: %s blocks=%s", msg_type, block_types)
+
                 if isinstance(message, SystemMessage):
                     if message.subtype == "init" and hasattr(message, "data"):
                         sid = message.data.get("session_id")
@@ -223,13 +231,24 @@ class ClaudeAgentSession:
                             in_flight_tools[block.id] = (block.name, block.input or {})
                             if tool_progress_callback:
                                 preview = str(block.input)[:120] if block.input else ""
-                                tool_progress_callback("tool.started", block.name, preview, block.input)
+                                tool_progress_callback("tool.started", block.name, preview, block.input, tool_call_id=block.id)
 
                         elif isinstance(block, ToolResultBlock):
                             if tool_complete_callback:
                                 name, args = in_flight_tools.pop(block.tool_use_id, ("", {}))
                                 result_str = block.content if isinstance(block.content, str) else str(block.content)
                                 tool_complete_callback(block.tool_use_id, name, args, result_str)
+
+                elif isinstance(message, UserMessage):
+                    # Tool results come as UserMessage in the Claude Code
+                    # protocol.  Extract ToolResultBlock for callbacks.
+                    if hasattr(message, "content") and isinstance(message.content, list):
+                        for block in message.content:
+                            if isinstance(block, ToolResultBlock):
+                                if tool_complete_callback:
+                                    name, args = in_flight_tools.pop(block.tool_use_id, ("", {}))
+                                    result_str = block.content if isinstance(block.content, str) else str(block.content)
+                                    tool_complete_callback(block.tool_use_id, name, args, result_str)
 
                 elif isinstance(message, ResultMessage):
                     result_msg = message

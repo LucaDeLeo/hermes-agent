@@ -1769,23 +1769,27 @@ async def chat_endpoint(body: ChatRequest):
     except ImportError as e:
         raise HTTPException(status_code=500, detail=f"Chat runner unavailable: {e}")
 
+    import uuid
+    session_id = body.session_id or str(uuid.uuid4())
+
     conversation_history = []
     session_db = None
-    if body.session_id:
-        try:
-            from hermes_state import SessionDB
-            session_db = SessionDB()
+    try:
+        from hermes_state import SessionDB
+        session_db = SessionDB()
+        if body.session_id:
             conversation_history = session_db.get_messages_as_conversation(body.session_id)
-        except Exception as exc:
-            _log.warning("Failed to load conversation history for %s: %s", body.session_id, exc)
+    except Exception as exc:
+        _log.warning("Failed to load conversation history for %s: %s", body.session_id, exc)
 
-    on_delta, on_tool_progress, stream_q = make_stream_callbacks()
+    on_delta, on_tool_progress, on_tool_complete, stream_q = make_stream_callbacks()
 
     agent = create_chat_agent(
         platform="dashboard",
-        session_id=body.session_id,
+        session_id=session_id,
         stream_delta_callback=on_delta,
         tool_progress_callback=on_tool_progress,
+        tool_complete_callback=on_tool_complete,
         session_db=session_db,
     )
 
