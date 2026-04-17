@@ -608,6 +608,7 @@ class AIAgent:
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
         persist_session: bool = True,
+        harness: Optional[str] = None,
     ):
         """
         Initialize the AI Agent.
@@ -895,6 +896,12 @@ class AIAgent:
         self._is_native_anthropic_for_harness = False
         self._harness_messages: list = []
         self._harness_sdk_session_id: Optional[str] = None
+        # Explicit harness override from caller (e.g. Hermes Web UI).  Takes
+        # precedence over `model.harness` in cli-config.yaml.  Normalised to
+        # lowercase; empty/None means "fall back to config".
+        self._harness_override: Optional[str] = (
+            (harness or "").strip().lower() or None
+        )
         self._mcp_context: Optional[dict] = None
 
         if self.api_mode == "anthropic_messages":
@@ -3285,12 +3292,18 @@ class AIAgent:
                 pass
     
     @staticmethod
-    def _get_harness_mode(config: dict) -> str:
+    def _get_harness_mode_from_config(config: dict) -> str:
         """Read ``model.harness`` from a loaded config dict."""
         model_sec = config.get("model", {})
         if not isinstance(model_sec, dict):
             return ""
         return (model_sec.get("harness") or "").strip().lower()
+
+    def _get_harness_mode(self, config: dict) -> str:
+        """Resolve harness mode: explicit kwarg override wins over config."""
+        if self._harness_override is not None:
+            return self._harness_override
+        return self._get_harness_mode_from_config(config)
 
     def _load_sdk_session_id(self) -> Optional[str]:
         """Read the Claude SDK session_id from the session DB, or None."""
