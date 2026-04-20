@@ -11,7 +11,6 @@ import {
   Globe,
   Heart,
   KeyRound,
-  MessageCircle,
   MessageSquare,
   Package,
   Puzzle,
@@ -30,7 +29,6 @@ import StatusPage from "@/pages/StatusPage";
 import ConfigPage from "@/pages/ConfigPage";
 import EnvPage from "@/pages/EnvPage";
 import SessionsPage from "@/pages/SessionsPage";
-import ChatPage from "@/pages/ChatPage";
 import LogsPage from "@/pages/LogsPage";
 import AnalyticsPage from "@/pages/AnalyticsPage";
 import CronPage from "@/pages/CronPage";
@@ -49,7 +47,6 @@ const BUILTIN_NAV: NavItem[] = [
     label: "Sessions",
     icon: MessageSquare,
   },
-  { path: "/chat", labelKey: "chat", label: "Chat", icon: MessageCircle },
   {
     path: "/analytics",
     labelKey: "analytics",
@@ -76,7 +73,6 @@ const ICON_MAP: Record<string, React.ComponentType<{ className?: string }>> = {
   Globe,
   Heart,
   KeyRound,
-  MessageCircle,
   MessageSquare,
   Package,
   Puzzle,
@@ -235,7 +231,6 @@ export default function App() {
         <Routes>
           <Route path="/" element={<StatusPage />} />
           <Route path="/sessions" element={<SessionsPage />} />
-          <Route path="/chat" element={<ChatPage />} />
           <Route path="/analytics" element={<AnalyticsPage />} />
           <Route path="/logs" element={<LogsPage />} />
           <Route path="/cron" element={<CronPage />} />
