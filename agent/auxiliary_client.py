@@ -48,6 +48,7 @@ from openai import OpenAI
 from agent.credential_pool import load_pool
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
+from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +159,16 @@ _OR_HEADERS = {
     "HTTP-Referer": "https://hermes-agent.nousresearch.com",
     "X-OpenRouter-Title": "Hermes Agent",
     "X-OpenRouter-Categories": "productivity,cli-agent",
+}
+
+# Vercel AI Gateway app attribution headers. HTTP-Referer maps to
+# referrerUrl and X-Title maps to appName in the gateway's analytics.
+from hermes_cli import __version__ as _HERMES_VERSION
+
+_AI_GATEWAY_HEADERS = {
+    "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+    "X-Title": "Hermes Agent",
+    "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
 }
 
 # Nous Portal extra_body for product attribution.
@@ -806,9 +817,9 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
                 if is_native_gemini_base_url(base_url):
                     return GeminiNativeClient(api_key=api_key, base_url=base_url), model
             extra = {}
-            if "api.kimi.com" in base_url.lower():
+            if base_url_host_matches(base_url, "api.kimi.com"):
                 extra["default_headers"] = {"User-Agent": "KimiCLI/1.30.0"}
-            elif "api.githubcopilot.com" in base_url.lower():
+            elif base_url_host_matches(base_url, "api.githubcopilot.com"):
                 from hermes_cli.models import copilot_default_headers
 
                 extra["default_headers"] = copilot_default_headers()
@@ -832,9 +843,9 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
             if is_native_gemini_base_url(base_url):
                 return GeminiNativeClient(api_key=api_key, base_url=base_url), model
         extra = {}
-        if "api.kimi.com" in base_url.lower():
+        if base_url_host_matches(base_url, "api.kimi.com"):
             extra["default_headers"] = {"User-Agent": "KimiCLI/1.30.0"}
-        elif "api.githubcopilot.com" in base_url.lower():
+        elif base_url_host_matches(base_url, "api.githubcopilot.com"):
             from hermes_cli.models import copilot_default_headers
 
             extra["default_headers"] = copilot_default_headers()
@@ -983,7 +994,7 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[st
         return None, None, None
 
     custom_base = custom_base.strip().rstrip("/")
-    if "openrouter.ai" in custom_base.lower():
+    if base_url_host_matches(custom_base, "openrouter.ai"):
         # requested='custom' falls back to OpenRouter when no custom endpoint is
         # configured. Treat that as "no custom endpoint" for auxiliary routing.
         return None, None, None
@@ -1016,6 +1027,8 @@ def _validate_proxy_env_urls() -> None:
     error that doesn't name the offending env var.
     """
     from urllib.parse import urlparse
+
+    normalize_proxy_env_vars()
 
     for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
                 "https_proxy", "http_proxy", "all_proxy"):
@@ -1422,14 +1435,14 @@ def _to_async_client(sync_client, model: str):
         "api_key": sync_client.api_key,
         "base_url": str(sync_client.base_url),
     }
-    base_lower = str(sync_client.base_url).lower()
-    if "openrouter" in base_lower:
+    sync_base_url = str(sync_client.base_url)
+    if base_url_host_matches(sync_base_url, "openrouter.ai"):
         async_kwargs["default_headers"] = dict(_OR_HEADERS)
-    elif "api.githubcopilot.com" in base_lower:
+    elif base_url_host_matches(sync_base_url, "api.githubcopilot.com"):
         from hermes_cli.models import copilot_default_headers
 
         async_kwargs["default_headers"] = copilot_default_headers()
-    elif "api.kimi.com" in base_lower:
+    elif base_url_host_matches(sync_base_url, "api.kimi.com"):
         async_kwargs["default_headers"] = {"User-Agent": "KimiCLI/1.30.0"}
     return AsyncOpenAI(**async_kwargs), model
 
@@ -1506,8 +1519,7 @@ def resolve_provider_client(
         # Auto-detect: api.openai.com + codex model name pattern
         if api_mode and api_mode != "codex_responses":
             return False  # explicit non-codex mode
-        normalized_base = (base_url_str or "").strip().lower()
-        if "api.openai.com" in normalized_base and "openrouter" not in normalized_base:
+        if base_url_hostname(base_url_str) == "api.openai.com":
             model_lower = (model_str or "").lower()
             if "codex" in model_lower:
                 return True
@@ -1611,9 +1623,9 @@ def resolve_provider_client(
                 provider,
             )
             extra = {}
-            if "api.kimi.com" in custom_base.lower():
+            if base_url_host_matches(custom_base, "api.kimi.com"):
                 extra["default_headers"] = {"User-Agent": "KimiCLI/1.30.0"}
-            elif "api.githubcopilot.com" in custom_base.lower():
+            elif base_url_host_matches(custom_base, "api.githubcopilot.com"):
                 from hermes_cli.models import copilot_default_headers
                 extra["default_headers"] = copilot_default_headers()
             client = OpenAI(api_key=custom_key, base_url=custom_base, **extra)
@@ -1718,9 +1730,9 @@ def resolve_provider_client(
 
         # Provider-specific headers
         headers = {}
-        if "api.kimi.com" in base_url.lower():
+        if base_url_host_matches(base_url, "api.kimi.com"):
             headers["User-Agent"] = "KimiCLI/1.30.0"
-        elif "api.githubcopilot.com" in base_url.lower():
+        elif base_url_host_matches(base_url, "api.githubcopilot.com"):
             from hermes_cli.models import copilot_default_headers
 
             headers.update(copilot_default_headers())
@@ -2015,7 +2027,7 @@ def auxiliary_max_tokens_param(value: int) -> dict:
     # Only use max_completion_tokens for direct OpenAI custom endpoints
     if (not or_key
             and _read_nous_auth() is None
-            and "api.openai.com" in custom_base.lower()):
+            and base_url_hostname(custom_base) == "api.openai.com"):
         return {"max_completion_tokens": value}
     return {"max_tokens": value}
 
@@ -2144,7 +2156,7 @@ def cleanup_stale_async_clients() -> None:
 
 def _is_openrouter_client(client: Any) -> bool:
     for obj in (client, getattr(client, "_client", None), getattr(client, "client", None)):
-        if obj and "openrouter" in str(getattr(obj, "base_url", "") or "").lower():
+        if obj and base_url_host_matches(str(getattr(obj, "base_url", "") or ""), "openrouter.ai"):
             return True
     return False
 
@@ -2450,7 +2462,7 @@ def _build_call_kwargs(
         # Direct OpenAI api.openai.com with newer models needs max_completion_tokens.
         if provider == "custom":
             custom_base = base_url or _current_custom_base_url()
-            if "api.openai.com" in custom_base.lower():
+            if base_url_hostname(custom_base) == "api.openai.com":
                 kwargs["max_completion_tokens"] = max_tokens
             else:
                 kwargs["max_tokens"] = max_tokens

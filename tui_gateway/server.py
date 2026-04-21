@@ -1608,7 +1608,6 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     try:
-        from datetime import datetime
         from hermes_cli.clipboard import has_clipboard_image, save_clipboard_image
     except Exception as e:
         return _err(rid, 5027, f"clipboard unavailable: {e}")
@@ -1645,12 +1644,17 @@ def _(rid, params: dict) -> dict:
     if not raw:
         return _err(rid, 4015, "path required")
     try:
-        from cli import _IMAGE_EXTENSIONS, _resolve_attachment_path, _split_path_input
+        from cli import _IMAGE_EXTENSIONS, _detect_file_drop, _resolve_attachment_path, _split_path_input
 
-        path_token, remainder = _split_path_input(raw)
-        image_path = _resolve_attachment_path(path_token)
-        if image_path is None:
-            return _err(rid, 4016, f"image not found: {path_token}")
+        dropped = _detect_file_drop(raw)
+        if dropped:
+            image_path = dropped["path"]
+            remainder = dropped["remainder"]
+        else:
+            path_token, remainder = _split_path_input(raw)
+            image_path = _resolve_attachment_path(path_token)
+            if image_path is None:
+                return _err(rid, 4016, f"image not found: {path_token}")
         if image_path.suffix.lower() not in _IMAGE_EXTENSIONS:
             return _err(rid, 4016, f"unsupported image: {image_path.name}")
         session.setdefault("attached_images", []).append(str(image_path))
@@ -2687,7 +2691,6 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     days = params.get("days", 30)
     try:
-        import time
         cutoff = time.time() - days * 86400
         rows = [s for s in _get_db().list_sessions_rich(limit=500) if (s.get("started_at") or 0) >= cutoff]
         return _ok(rid, {"days": days, "sessions": len(rows), "messages": sum(s.get("message_count", 0) for s in rows)})
