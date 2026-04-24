@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 import os
 import random
 import re
+import sqlite3
 import sys
 import tempfile
 import time
@@ -687,6 +688,101 @@ def _qwen_portal_headers() -> dict:
     }
 
 
+def _flatten_message_text(content: Any) -> str:
+    """Extract plain text from a message content field.
+
+    Handles string, list-of-parts (multimodal — text parts kept, images
+    and other binary parts dropped), and falls back to str() for anything
+    else.  Used to build the harness history prelude without leaking
+    tool-call blocks or base64 image payloads into the user prompt.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for p in content:
+            if isinstance(p, dict):
+                ptype = p.get("type")
+                if ptype == "text" and isinstance(p.get("text"), str):
+                    parts.append(p["text"])
+                # Drop tool_use/tool_result (can't replay across SDK session
+                # boundary) and image blobs (would blow the prelude cap).
+            elif isinstance(p, str):
+                parts.append(p)
+        return "\n".join(parts)
+    return str(content) if content is not None else ""
+
+
+def _build_harness_history_prelude(
+    messages: list,
+    max_chars: int = 120_000,
+    tail_turns: int = 10,
+) -> tuple[str, dict]:
+    """Build a plain-text prelude summarising prior conversation turns.
+
+    Used by ``_run_claude_code_conversation`` when the SDK ``resume``
+    chain is broken and we need to feed context to the model through
+    the user message itself.
+
+    Only ``role in ('user', 'assistant')`` messages with non-empty text
+    are included; tool-role messages, empty assistants, and entries with
+    an ``_error`` marker are dropped.  If the serialised transcript
+    exceeds ``max_chars``, only the last ``tail_turns`` kept messages
+    are emitted, prefixed with an "[earlier turns omitted]" marker.
+
+    Returns ``(prelude_str, meta)`` where meta has ``turns`` (count of
+    messages actually included) and ``chars`` (final serialised length).
+    Returns ``("", {...})`` if the history is empty or produces no text.
+    """
+    if not messages:
+        return "", {"turns": 0, "chars": 0}
+
+    # Filter + flatten in one pass.
+    kept: list[tuple[str, str]] = []  # (role, text)
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        if m.get("_error"):
+            continue
+        role = m.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        text = _flatten_message_text(m.get("content", "")).strip()
+        if not text:
+            continue
+        kept.append((role, text))
+
+    if not kept:
+        return "", {"turns": 0, "chars": 0}
+
+    def _serialize(entries: list[tuple[str, str]], truncated: bool) -> str:
+        lines = [
+            "The following is the prior conversation in this session. "
+            "Use it as context for the user's latest message.",
+            "",
+            "<prior_conversation>",
+        ]
+        if truncated:
+            lines.append("[earlier turns omitted for length]")
+        for role, text in entries:
+            label = "User" if role == "user" else "Assistant"
+            lines.append(f"{label}: {text}")
+        lines.append("</prior_conversation>")
+        lines.append("")
+        lines.append("User's latest message:")
+        lines.append("")
+        return "\n".join(lines)
+
+    full = _serialize(kept, truncated=False)
+    if len(full) <= max_chars:
+        return full, {"turns": len(kept), "chars": len(full)}
+
+    # Too big — take the last tail_turns and mark as truncated.
+    tail = kept[-max(1, tail_turns):]
+    trimmed = _serialize(tail, truncated=True)
+    return trimmed, {"turns": len(tail), "chars": len(trimmed)}
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -1081,6 +1177,9 @@ class AIAgent:
         self._is_native_anthropic_for_harness = False
         self._harness_messages: list = []
         self._harness_sdk_session_id: Optional[str] = None
+        # Set True when the resume chain can't be trusted — see
+        # _reconcile_sdk_session_after_turn and _persist_sdk_sid.
+        self._harness_resume_known_dead: bool = False
         # Explicit harness override from caller (e.g. Hermes Web UI).  Takes
         # precedence over `model.harness` in cli-config.yaml.  Normalised to
         # lowercase; empty/None means "fall back to config".
@@ -1428,6 +1527,14 @@ class AIAgent:
         # needed later by the startup feasibility check.  Avoid exposing a
         # broad pseudo-public config object on the agent instance.
         self._aux_compression_context_length_config = None
+
+        # Harness prelude sizing — snapshot at init so the per-turn hot path
+        # in _run_claude_code_conversation doesn't re-parse config.yaml.
+        _model_cfg = _agent_cfg.get("model") if isinstance(_agent_cfg, dict) else None
+        if not isinstance(_model_cfg, dict):
+            _model_cfg = {}
+        self._harness_prelude_max_chars = int(_model_cfg.get("harness_prelude_max_chars") or 120_000)
+        self._harness_prelude_tail_turns = int(_model_cfg.get("harness_prelude_tail_turns") or 10)
 
         # Claude Code harness — delegate to Claude Agent SDK
         if self._get_harness_mode(_agent_cfg) == "claude_code" and self._is_native_anthropic_for_harness:
@@ -1904,6 +2011,7 @@ class AIAgent:
         if self._claude_agent_session is not None:
             self._teardown_harness()
             self._harness_sdk_session_id = self._load_sdk_session_id()
+            self._harness_resume_known_dead = False
             try:
                 self._create_harness()
             except Exception as exc:
@@ -1957,6 +2065,7 @@ class AIAgent:
         # Clear SDK session_id so a stale Claude Code session isn't resumed
         # after turns on a different provider.
         self._harness_sdk_session_id = None
+        self._harness_resume_known_dead = False
 
         # ── Build new client ──
         if api_mode == "anthropic_messages":
@@ -3882,6 +3991,53 @@ class AIAgent:
             pass
         return None
 
+    def _persist_sdk_sid(self, sdk_sid: str) -> bool:
+        """Write ``claude_sdk_session_id`` into the session row's model_config.
+
+        Returns True on success, False on failure.  On a structural
+        failure (anything other than transient SQLite lock contention,
+        which ``SessionDB._execute_write`` retries), sets
+        ``self._harness_resume_known_dead = True`` so the next turn falls
+        back to injecting a history prelude.
+        """
+        if not self._session_db or not self.session_id or not sdk_sid:
+            return False
+        try:
+            self._session_db.patch_model_config(
+                self.session_id,
+                {"claude_sdk_session_id": sdk_sid},
+            )
+            return True
+        except sqlite3.OperationalError as exc:
+            # Transient lock contention — the write may succeed on the
+            # end-of-turn retry at the bottom of _run_claude_code_conversation.
+            logger.info(
+                "Transient SQLite contention persisting claude_sdk_session_id=%s for session=%s: %s",
+                sdk_sid, self.session_id, exc,
+            )
+            return False
+        except Exception:
+            logger.warning(
+                "Failed to persist claude_sdk_session_id=%s for session=%s",
+                sdk_sid, self.session_id,
+                exc_info=True,
+            )
+            self._harness_resume_known_dead = True
+            return False
+
+    def _on_harness_sdk_session_captured(self, sdk_sid: str) -> None:
+        """Adapter callback: SDK just emitted a new session_id.
+
+        Fires inside ``ClaudeAgentSession._exchange`` from the SDK's async
+        event loop — do no I/O here, only update in-memory state.  The
+        DB persist happens at end-of-turn in
+        ``_reconcile_sdk_session_after_turn`` (safe to block there, the
+        stream is done).
+        """
+        if not sdk_sid or sdk_sid == self._harness_sdk_session_id:
+            return
+        self._harness_sdk_session_id = sdk_sid
+
     def _resolve_harness_cwd(self) -> str:
         """Resolve the working directory the Claude Code subprocess runs in.
 
@@ -3945,6 +4101,7 @@ class AIAgent:
             max_turns=self.max_iterations,
             resume_session_id=self._harness_sdk_session_id,
             mcp_server_config=mcp_server_config,
+            on_session_captured=self._on_harness_sdk_session_captured,
         )
         session.connect()
         self._claude_agent_session = session
@@ -8788,6 +8945,15 @@ class AIAgent:
         Called when ``model.harness: claude_code`` is active.  Claude Code
         owns the tool loop; Hermes fires its callbacks and returns the
         standard result dict so the TUI / gateway layer works unchanged.
+
+        Context continuity: the happy path relies on the SDK's
+        ``resume=<sdk_session_id>`` chain.  When that chain is broken
+        (no persisted sdk_sid loadable from state.db, DB write failed on
+        a prior turn, or the SDK silently dropped our last ``resume`` and
+        gave us a fresh session_id), we inject a plain-text transcript of
+        prior turns into ``user_message`` so the model still sees context.
+        ``original_user_message`` is never prelude-wrapped so persisted
+        history, trajectories, and hooks stay clean.
         """
         # Pass only the lightweight context (SOUL.md, AGENTS.md, memory,
         # user profile) — not the full Hermes system prompt which includes
@@ -8812,8 +8978,11 @@ class AIAgent:
             _ctx_parts.append(self.ephemeral_system_prompt)
         effective_system = "\n\n".join(p.strip() for p in _ctx_parts if p.strip()) or None
 
+        sdk_sid_at_entry = self._harness_sdk_session_id
+        effective_user_msg = self._maybe_inject_history_prelude(user_message, sdk_sid_at_entry)
+
         result = self._claude_agent_session.send_message(
-            user_message,
+            effective_user_msg,
             system_prompt=effective_system,
             thinking_callback=self.thinking_callback,
             thinking_delta_callback=self.thinking_delta_callback,
@@ -8835,19 +9004,12 @@ class AIAgent:
         interrupted = result.get("interrupted", False)
         completed = result.get("completed", False)
 
-        # Capture SDK session_id for resume across fresh AIAgent instances.
-        # Persisted to the session DB so it survives process restarts.
-        sdk_sid = result.get("session_id")
-        if sdk_sid and sdk_sid != self._harness_sdk_session_id:
-            self._harness_sdk_session_id = sdk_sid
-            if self._session_db and self.session_id:
-                try:
-                    self._session_db.patch_model_config(
-                        self.session_id,
-                        {"claude_sdk_session_id": sdk_sid},
-                    )
-                except Exception:
-                    pass
+        self._reconcile_sdk_session_after_turn(
+            sdk_sid_at_entry=sdk_sid_at_entry,
+            sdk_sid=result.get("session_id"),
+            interrupted=interrupted,
+            final_response=final_response,
+        )
 
         # Append to cumulative list so _persist_session sees a growing
         # list across turns (required by _last_flushed_db_idx tracking).
@@ -8888,6 +9050,82 @@ class AIAgent:
         # so CLI/gateway callers get the full conversation history.
         result["messages"] = list(self._harness_messages)
         return result
+
+    def _maybe_inject_history_prelude(self, user_message: str, sdk_sid_at_entry: Optional[str]) -> str:
+        """Return ``user_message`` prefixed with a prior-conversation prelude
+        when the SDK resume chain can't carry context.
+
+        Trigger: no stored sdk_sid to resume, or our last resume attempt
+        silently failed (``_harness_resume_known_dead``), and we have
+        prior turns to replay.  ``original_user_message`` is deliberately
+        NOT wrapped — persisted history and hooks must see only real
+        user text.
+        """
+        resume_available = (
+            sdk_sid_at_entry is not None
+            and not self._harness_resume_known_dead
+        )
+        if resume_available or not self._harness_messages:
+            return user_message
+        prelude, meta = _build_harness_history_prelude(
+            self._harness_messages,
+            max_chars=self._harness_prelude_max_chars,
+            tail_turns=self._harness_prelude_tail_turns,
+        )
+        if not prelude:
+            return user_message
+        reason = "resume_unavailable" if sdk_sid_at_entry is None else "resume_known_dead"
+        logger.info(
+            "Harness prelude injected: turns=%d chars=%d reason=%s",
+            meta.get("turns", 0), meta.get("chars", 0), reason,
+        )
+        return prelude + user_message
+
+    def _reconcile_sdk_session_after_turn(
+        self,
+        *,
+        sdk_sid_at_entry: Optional[str],
+        sdk_sid: Optional[str],
+        interrupted: bool,
+        final_response: Optional[str],
+    ) -> None:
+        """Update resume-chain state based on what the SDK returned.
+
+        Three cases, in order:
+        1. ``sdk_sid`` differs from the id we asked to resume → SDK
+           silently dropped our resume; mark the chain dead so the next
+           turn injects a prelude, then adopt the new id.
+        2. ``sdk_sid`` matches the entry id → healthy resume; clear any
+           stale known-dead flag set by an earlier failure.
+        3. Turn completed but no ``sdk_sid`` was ever revealed → cross-turn
+           resume is unavailable; mark the chain dead.
+
+        Persist the new id if the adapter's mid-stream callback didn't
+        already (end-of-turn safety net).
+        """
+        if sdk_sid_at_entry and sdk_sid and sdk_sid != sdk_sid_at_entry:
+            logger.warning(
+                "Claude SDK resume mismatch: requested=%s got=%s "
+                "— next turn will inject history prelude",
+                sdk_sid_at_entry, sdk_sid,
+            )
+            self._harness_resume_known_dead = True
+        elif sdk_sid and sdk_sid == sdk_sid_at_entry:
+            self._harness_resume_known_dead = False
+
+        if sdk_sid:
+            # Persist unconditionally: the mid-stream callback only
+            # updates in-memory state, so this is the single DB write
+            # per turn.  Idempotent when the stored id already matches.
+            self._harness_sdk_session_id = sdk_sid
+            self._persist_sdk_sid(sdk_sid)
+        elif not interrupted and final_response:
+            logger.warning(
+                "Claude SDK emitted no session_id for session=%s; "
+                "cross-turn resume unavailable — next turn will inject history prelude",
+                self.session_id,
+            )
+            self._harness_resume_known_dead = True
 
     def run_conversation(
         self,

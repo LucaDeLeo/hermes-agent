@@ -80,6 +80,7 @@ class ClaudeAgentSession:
         allowed_tools: Optional[list] = None,
         resume_session_id: Optional[str] = None,
         mcp_server_config=None,
+        on_session_captured: Optional[Callable[[str], None]] = None,
     ):
         if not _check_sdk():
             raise ImportError(
@@ -97,6 +98,7 @@ class ClaudeAgentSession:
         ]
         self._mcp_server_config = mcp_server_config
         self._session_id: Optional[str] = resume_session_id
+        self._on_session_captured = on_session_captured
         self._connected = True  # no connect step needed for query()
 
     def connect(self):
@@ -106,6 +108,28 @@ class ClaudeAgentSession:
     def close(self):
         """No-op — query() is stateless per call."""
         self._connected = False
+
+    def _mark_session_captured(self, sid: Optional[str]) -> None:
+        """Record ``sid`` as the current SDK session_id and notify the owner.
+
+        Called from the init SystemMessage path and the final ResultMessage
+        path; centralising both sites means the new-id guard and the
+        callback error handling stay in sync.  A callback that raises is
+        logged but never propagated — the SDK event loop must keep draining.
+        """
+        if not sid or sid == self._session_id:
+            return
+        self._session_id = sid
+        if self._on_session_captured is None:
+            return
+        try:
+            self._on_session_captured(sid)
+        except Exception as cb_exc:
+            logger.warning(
+                "on_session_captured callback failed: %s",
+                cb_exc,
+                exc_info=True,
+            )
 
     def send_message(
         self,
@@ -217,9 +241,7 @@ class ClaudeAgentSession:
 
                 if isinstance(message, SystemMessage):
                     if message.subtype == "init" and hasattr(message, "data"):
-                        sid = message.data.get("session_id")
-                        if sid:
-                            self._session_id = sid
+                        self._mark_session_captured(message.data.get("session_id"))
 
                 elif isinstance(message, StreamEvent):
                     ev = message.event or {}
@@ -288,9 +310,10 @@ class ClaudeAgentSession:
             usage = result_msg.usage or {}
             if not final_response and result_msg.result:
                 final_response = result_msg.result
-            # Capture session_id from result if not already set from init message
+            # Fallback capture: SDKs that skip the init SystemMessage still
+            # reveal the session_id on the final ResultMessage.
             if not self._session_id and hasattr(result_msg, "session_id"):
-                self._session_id = result_msg.session_id
+                self._mark_session_captured(result_msg.session_id)
 
         return {
             "final_response": final_response,
