@@ -2110,7 +2110,7 @@ class AIAgent:
         # session_id from the DB for the (possibly new) Hermes session so
         # /resume and session-switch flows reconnect to the right Claude
         # Code conversation instead of starting fresh.
-        if self._claude_agent_session is not None:
+        if getattr(self, "_claude_agent_session", None) is not None:
             self._teardown_harness()
             self._harness_sdk_session_id = self._load_sdk_session_id()
             self._harness_resume_known_dead = False
@@ -2221,7 +2221,7 @@ class AIAgent:
         )
 
         # ── Re-create Claude Code harness if still on native Anthropic ──
-        if is_native_anthropic:
+        if new_provider == "anthropic":
             try:
                 from hermes_cli.config import load_config as _lc_sw
                 if self._get_harness_mode(_lc_sw()) == "claude_code":
@@ -4326,7 +4326,10 @@ class AIAgent:
 
     def _teardown_harness(self):
         """Disconnect and discard the Claude Agent SDK session."""
-        session = self._claude_agent_session
+        # getattr guard: AIAgent.__init__ sets _claude_agent_session, but
+        # tests sometimes construct bare instances via object.__new__ to
+        # exercise switch_model/reset_session_state in isolation.
+        session = getattr(self, "_claude_agent_session", None)
         if session is not None:
             try:
                 session.close()
