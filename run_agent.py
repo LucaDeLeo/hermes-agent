@@ -10774,6 +10774,13 @@ class AIAgent:
             # (mirrors the normal path's injection at API-call time).
             _injections = []
             if self._memory_manager:
+                # Notify providers of the new turn before prefetch so cadence
+                # gates (contextCadence/dialecticCadence) see the right turn.
+                try:
+                    _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
+                    self._memory_manager.on_turn_start(self._user_turn_count, _turn_msg)
+                except Exception:
+                    pass
                 try:
                     _query = original_user_message if isinstance(original_user_message, str) else ""
                     _prefetch = self._memory_manager.prefetch_all(_query) or ""
