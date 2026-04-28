@@ -185,6 +185,25 @@ class TestBuildSessionContextPrompt:
         assert "Telegram" in prompt
         assert "Home Chat" in prompt
 
+    def test_bluebubbles_prompt_mentions_short_conversational_i_message_format(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.BLUEBUBBLES: PlatformConfig(enabled=True, extra={"server_url": "http://localhost:1234", "password": "secret"}),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.BLUEBUBBLES,
+            chat_id="iMessage;-;user@example.com",
+            chat_name="Ben",
+            chat_type="dm",
+        )
+        ctx = build_session_context(source, config)
+        prompt = build_session_context_prompt(ctx)
+
+        assert "responding via iMessage" in prompt
+        assert "short and conversational" in prompt
+        assert "blank line" in prompt
+
     def test_discord_prompt(self):
         config = GatewayConfig(
             platforms={
@@ -226,6 +245,7 @@ class TestBuildSessionContextPrompt:
         assert "Slack" in prompt
         assert "cannot search" in prompt.lower()
         assert "pin" in prompt.lower()
+        assert "current message's slack block/attachment payload" in prompt.lower()
 
     def test_discord_prompt_with_channel_topic(self):
         """Channel topic should appear in the session context prompt."""
@@ -1213,3 +1233,34 @@ class TestRewriteTranscriptPreservesReasoning:
         assert after[0].get("reasoning_content") == "provider scratchpad"
         assert after[0].get("reasoning_details") == [{"type": "summary", "text": "step by step"}]
         assert after[0].get("codex_reasoning_items") == [{"id": "r1", "type": "reasoning"}]
+
+    def test_db_rewrite_is_atomic_on_insert_failure(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "test.db")
+        session_id = "atomic-rewrite-test"
+        db.create_session(session_id=session_id, source="cli")
+        db.append_message(session_id=session_id, role="user", content="before user")
+        db.append_message(session_id=session_id, role="assistant", content="before assistant")
+
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._db = db
+        store._loaded = True
+
+        replacement = [
+            {"role": "user", "content": "after user"},
+            {
+                "role": "assistant",
+                "content": {"not": "sqlite-bindable but JSONL-safe"},
+            },
+        ]
+
+        store.rewrite_transcript(session_id, replacement)
+
+        after = db.get_messages_as_conversation(session_id)
+        assert [msg["content"] for msg in after] == [
+            "before user",
+            "before assistant",
+        ]

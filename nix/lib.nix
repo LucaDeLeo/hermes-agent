@@ -156,7 +156,7 @@
       for entry in "''${ENTRIES[@]}"; do
         IFS=":" read -r ATTR FOLDER NIX_FILE <<< "$entry"
         echo "==> .#$ATTR ($FOLDER -> $NIX_FILE)"
-        OUTPUT=$(nix build ".#$ATTR.npmDeps" --no-link --print-build-logs 2>&1)
+        OUTPUT=$(nix build ".#$ATTR.npmDeps" --no-link --rebuild --print-build-logs 2>&1)
         STATUS=$?
         if [ "$STATUS" -eq 0 ]; then
           echo "    ok"
@@ -187,7 +187,10 @@
 
         if [ "$MODE" = "--apply" ]; then
           sed -i "s|hash = \"sha256-[^\"]*\";|hash = \"$NEW_HASH\";|" "$NIX_FILE"
-          nix build ".#$ATTR.npmDeps" --no-link --print-build-logs
+          if ! nix build ".#$ATTR.npmDeps" --no-link --print-build-logs; then
+            echo "    verification build failed after hash update" >&2
+            exit 1
+          fi
           FIXED=1
           echo "    fixed"
         fi

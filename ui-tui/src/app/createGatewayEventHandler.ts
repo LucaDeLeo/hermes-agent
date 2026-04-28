@@ -220,7 +220,12 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         const text = ev.payload?.text
 
         if (text !== undefined) {
-          scheduleThinkingStatus(text ? String(text) : statusFromBusy())
+          const value = String(text)
+          scheduleThinkingStatus(value || statusFromBusy())
+
+          if (value) {
+            turnController.recordReasoningDelta(value)
+          }
         }
 
         return
@@ -316,11 +321,29 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       }
 
       case 'gateway.start_timeout': {
-        const { cwd, python } = ev.payload ?? {}
+        const { cwd, python, stderr_tail: stderrTail } = ev.payload ?? {}
         const trace = python || cwd ? ` · ${String(python || '')} ${String(cwd || '')}`.trim() : ''
 
         setStatus('gateway startup timeout')
         turnController.pushActivity(`gateway startup timed out${trace} · /logs to inspect`, 'error')
+
+        // Surface the most useful stderr lines inline so users can tell
+        // "wrong python", "missing dep", and "config parse failure"
+        // apart without leaving the TUI.  Filter blank rows BEFORE
+        // taking the last N so trailing empty lines in the buffer
+        // don't crowd out actual content; truncate to match the
+        // 120-char clip used for `gateway.stderr` activity entries.
+        const STDERR_LINE_CAP = 120
+        const STDERR_LINES_MAX = 8
+        const tailLines = (stderrTail ?? '')
+          .split('\n')
+          .map(l => l.trim())
+          .filter(Boolean)
+          .slice(-STDERR_LINES_MAX)
+
+        for (const line of tailLines) {
+          turnController.pushActivity(line.slice(0, STDERR_LINE_CAP), 'error')
+        }
 
         return
       }
@@ -367,6 +390,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
 
       case 'tool.start':
+        turnController.recordTodos(ev.payload.todos)
         turnController.recordToolStart(ev.payload.tool_id, ev.payload.name ?? 'tool', ev.payload.context ?? '')
 
         return
@@ -374,23 +398,24 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         const inlineDiffText =
           ev.payload.inline_diff && getUiState().inlineDiffs ? stripAnsi(String(ev.payload.inline_diff)).trim() : ''
 
-        turnController.recordToolComplete(
-          ev.payload.tool_id,
-          ev.payload.name,
-          ev.payload.error,
-          inlineDiffText ? '' : ev.payload.summary
-        )
-
-        if (!inlineDiffText) {
-          return
+        if (inlineDiffText) {
+          turnController.recordInlineDiffToolComplete(
+            inlineDiffText,
+            ev.payload.tool_id,
+            ev.payload.name,
+            ev.payload.error,
+            ev.payload.duration_s
+          )
+        } else {
+          turnController.recordToolComplete(
+            ev.payload.tool_id,
+            ev.payload.name,
+            ev.payload.error,
+            ev.payload.summary,
+            ev.payload.duration_s,
+            ev.payload.todos
+          )
         }
-
-        // Anchor the diff to where the edit happened in the turn — between
-        // the narration that preceded the tool call and whatever the agent
-        // streams afterwards. The previous end-merge put the diff at the
-        // bottom of the final message even when the edit fired mid-turn,
-        // which read as "the agent wrote this after saying that".
-        turnController.pushInlineDiffSegment(inlineDiffText)
 
         return
       }
@@ -428,12 +453,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       case 'background.complete':
         dropBgTask(ev.payload.task_id)
         sys(`[bg ${ev.payload.task_id}] ${ev.payload.text}`)
-
-        return
-
-      case 'btw.complete':
-        dropBgTask('btw:x')
-        sys(`[btw] ${ev.payload.text}`)
 
         return
 

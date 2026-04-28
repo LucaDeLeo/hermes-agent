@@ -287,7 +287,7 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "display.busy_input_mode": {
         "type": "select",
         "description": "Input behavior while agent is running",
-        "options": ["queue", "interrupt", "block"],
+        "options": ["interrupt", "queue", "steer"],
     },
     "memory.provider": {
         "type": "select",
@@ -736,7 +736,7 @@ async def get_sessions(limit: int = 20, offset: int = 0):
             return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
         finally:
             db.close()
-    except Exception as e:
+    except Exception:
         _log.exception("GET /api/sessions failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
@@ -968,7 +968,7 @@ async def update_config(body: ConfigUpdate):
     try:
         save_config(_denormalize_config_from_web(body.config))
         return {"ok": True}
-    except Exception as e:
+    except Exception:
         _log.exception("PUT /api/config failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
@@ -997,7 +997,7 @@ async def set_env_var(body: EnvVarUpdate):
     try:
         save_env_value(body.key, body.value)
         return {"ok": True, "key": body.key}
-    except Exception as e:
+    except Exception:
         _log.exception("PUT /api/env failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
@@ -1011,7 +1011,7 @@ async def remove_env_var(body: EnvVarDelete):
         return {"ok": True, "key": body.key}
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         _log.exception("DELETE /api/env failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
@@ -1533,26 +1533,30 @@ def _submit_anthropic_pkce(session_id: str, code_input: str) -> Dict[str, Any]:
         with urllib.request.urlopen(req, timeout=20) as resp:
             result = json.loads(resp.read().decode())
     except Exception as e:
-        sess["status"] = "error"
-        sess["error_message"] = f"Token exchange failed: {e}"
+        with _oauth_sessions_lock:
+            sess["status"] = "error"
+            sess["error_message"] = f"Token exchange failed: {e}"
         return {"ok": False, "status": "error", "message": sess["error_message"]}
 
     access_token = result.get("access_token", "")
     refresh_token = result.get("refresh_token", "")
     expires_in = int(result.get("expires_in") or 3600)
     if not access_token:
-        sess["status"] = "error"
-        sess["error_message"] = "No access token returned"
+        with _oauth_sessions_lock:
+            sess["status"] = "error"
+            sess["error_message"] = "No access token returned"
         return {"ok": False, "status": "error", "message": sess["error_message"]}
 
     expires_at_ms = int(time.time() * 1000) + (expires_in * 1000)
     try:
         _save_anthropic_oauth_creds(access_token, refresh_token, expires_at_ms)
     except Exception as e:
-        sess["status"] = "error"
-        sess["error_message"] = f"Save failed: {e}"
+        with _oauth_sessions_lock:
+            sess["status"] = "error"
+            sess["error_message"] = f"Save failed: {e}"
         return {"ok": False, "status": "error", "message": sess["error_message"]}
-    sess["status"] = "approved"
+    with _oauth_sessions_lock:
+        sess["status"] = "approved"
     _log.info("oauth/pkce: anthropic login completed (session=%s)", session_id)
     return {"ok": True, "status": "approved"}
 
@@ -1564,7 +1568,6 @@ async def _start_device_code_flow(provider_id: str) -> Dict[str, Any]:
     then spawns a background poller. Returns the user-facing display fields
     so the UI can render the verification page link + user code.
     """
-    from hermes_cli import auth as hauth
     if provider_id == "nous":
         from hermes_cli.auth import _request_device_code, PROVIDER_REGISTRY
         import httpx
@@ -2328,16 +2331,14 @@ def _resolve_chat_argv(
     from hermes_cli.main import PROJECT_ROOT, _make_tui_argv
 
     argv, cwd = _make_tui_argv(PROJECT_ROOT / "ui-tui", tui_dev=False)
-    env: Optional[dict] = None
+    env = os.environ.copy()
+    env.setdefault("NODE_ENV", "production")
 
-    if resume or sidecar_url:
-        env = os.environ.copy()
+    if resume:
+        env["HERMES_TUI_RESUME"] = resume
 
-        if resume:
-            env["HERMES_TUI_RESUME"] = resume
-
-        if sidecar_url:
-            env["HERMES_TUI_SIDECAR_URL"] = sidecar_url
+    if sidecar_url:
+        env["HERMES_TUI_SIDECAR_URL"] = sidecar_url
 
     return list(argv), str(cwd) if cwd else None, env
 
