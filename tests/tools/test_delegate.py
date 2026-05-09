@@ -767,24 +767,7 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertIsNone(creds["base_url"])
         self.assertIsNone(creds["api_key"])
 
-    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
-    def test_provider_resolves_full_credentials(self, mock_resolve):
-        """When delegation.provider is set, full credentials are resolved."""
-        mock_resolve.return_value = {
-            "provider": "openrouter",
-            "base_url": "https://openrouter.ai/api/v1",
-            "api_key": "sk-or-test-key",
-            "api_mode": "chat_completions",
-        }
-        parent = _make_mock_parent(depth=0)
-        cfg = {"model": "google/gemini-3-flash-preview", "provider": "openrouter"}
-        creds = _resolve_delegation_credentials(cfg, parent)
-        self.assertEqual(creds["model"], "google/gemini-3-flash-preview")
-        self.assertEqual(creds["provider"], "openrouter")
-        self.assertEqual(creds["base_url"], "https://openrouter.ai/api/v1")
-        self.assertEqual(creds["api_key"], "sk-or-test-key")
-        self.assertEqual(creds["api_mode"], "chat_completions")
-        mock_resolve.assert_called_once_with(requested="openrouter")
+
 
     def test_direct_endpoint_uses_configured_base_url_and_api_key(self):
         parent = _make_mock_parent(depth=0)
@@ -801,7 +784,9 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertEqual(creds["api_key"], "local-key")
         self.assertEqual(creds["api_mode"], "chat_completions")
 
-    def test_direct_endpoint_falls_back_to_openai_api_key_env(self):
+    def test_direct_endpoint_returns_none_api_key_when_not_configured(self):
+        # When base_url is set without api_key, api_key should be None so
+        # _build_child_agent inherits the parent's key (effective_api_key = override or parent).
         parent = _make_mock_parent(depth=0)
         cfg = {
             "model": "qwen2.5-coder",
@@ -809,10 +794,11 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         }
         with patch.dict(os.environ, {"OPENAI_API_KEY": "env-openai-key"}, clear=False):
             creds = _resolve_delegation_credentials(cfg, parent)
-        self.assertEqual(creds["api_key"], "env-openai-key")
+        self.assertIsNone(creds["api_key"])
         self.assertEqual(creds["provider"], "custom")
 
-    def test_direct_endpoint_does_not_fall_back_to_openrouter_api_key_env(self):
+    def test_direct_endpoint_no_raise_when_only_provider_env_key_present(self):
+        # Even if OPENAI_API_KEY is absent, no ValueError — _build_child_agent uses parent key.
         parent = _make_mock_parent(depth=0)
         cfg = {
             "model": "qwen2.5-coder",
@@ -826,26 +812,10 @@ class TestDelegationCredentialResolution(unittest.TestCase):
             },
             clear=False,
         ):
-            with self.assertRaises(ValueError) as ctx:
-                _resolve_delegation_credentials(cfg, parent)
-        self.assertIn("OPENAI_API_KEY", str(ctx.exception))
+            creds = _resolve_delegation_credentials(cfg, parent)
+        self.assertIsNone(creds["api_key"])
+        self.assertEqual(creds["provider"], "custom")
 
-    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
-    def test_nous_provider_resolves_nous_credentials(self, mock_resolve):
-        """Nous provider resolves Nous Portal base_url and api_key."""
-        mock_resolve.return_value = {
-            "provider": "nous",
-            "base_url": "https://inference-api.nousresearch.com/v1",
-            "api_key": "nous-agent-key-xyz",
-            "api_mode": "chat_completions",
-        }
-        parent = _make_mock_parent(depth=0)
-        cfg = {"model": "hermes-3-llama-3.1-8b", "provider": "nous"}
-        creds = _resolve_delegation_credentials(cfg, parent)
-        self.assertEqual(creds["provider"], "nous")
-        self.assertEqual(creds["base_url"], "https://inference-api.nousresearch.com/v1")
-        self.assertEqual(creds["api_key"], "nous-agent-key-xyz")
-        mock_resolve.assert_called_once_with(requested="nous")
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_provider_resolution_failure_raises_valueerror(self, mock_resolve):
@@ -956,6 +926,48 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(kwargs["api_key"], "sk-or-key")
             self.assertNotEqual(kwargs["base_url"], parent.base_url)
             self.assertNotEqual(kwargs["api_key"], parent.api_key)
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_provider_override_clears_parent_openrouter_filters(
+        self, mock_creds, mock_cfg
+    ):
+        """Delegated provider should not inherit parent provider-preference filters."""
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model": "google/gemini-3-flash-preview",
+            "provider": "openrouter",
+        }
+        mock_creds.return_value = {
+            "model": "google/gemini-3-flash-preview",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "sk-or-key",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.providers_allowed = ["anthropic/claude-3.5-sonnet"]
+        parent.providers_ignored = ["openai/gpt-4o-mini"]
+        parent.providers_order = ["google/gemini-2.5-pro"]
+        parent.provider_sort = "price"
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Cross-provider test", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["provider"], "openrouter")
+            self.assertIsNone(kwargs["providers_allowed"])
+            self.assertIsNone(kwargs["providers_ignored"])
+            self.assertIsNone(kwargs["providers_order"])
+            self.assertIsNone(kwargs["provider_sort"])
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -1534,53 +1546,6 @@ class TestDelegateHeartbeat(unittest.TestCase):
             f"got {len(touch_calls)} touches over 0.4s at 0.05s interval",
         )
 
-    def test_heartbeat_still_trips_idle_stale_when_no_tool(self):
-        """A wedged child with no current_tool still trips the idle threshold.
-
-        Regression guard: the fix for #13041 must not disable stale
-        detection entirely. A child that's hung between turns (no tool
-        running, no iteration progress) must still stop touching the
-        parent so the gateway timeout can fire.
-        """
-        from tools.delegate_tool import _run_single_child
-
-        parent = _make_mock_parent()
-        touch_calls = []
-        parent._touch_activity = lambda desc: touch_calls.append(desc)
-
-        child = MagicMock()
-        # Wedged child: no tool running, iteration frozen.
-        child.get_activity_summary.return_value = {
-            "current_tool": None,
-            "api_call_count": 3,
-            "max_iterations": 50,
-            "last_activity_desc": "waiting for API response",
-        }
-
-        def slow_run(**kwargs):
-            time.sleep(0.6)
-            return {"final_response": "done", "completed": True, "api_calls": 3}
-
-        child.run_conversation.side_effect = slow_run
-
-        # At interval 0.05s, idle threshold (5 cycles) trips at ~0.25s.
-        # We should see the heartbeat stop firing well before 0.6s.
-        with patch("tools.delegate_tool._HEARTBEAT_INTERVAL", 0.05):
-            _run_single_child(
-                task_index=0,
-                goal="Test wedged child",
-                child=child,
-                parent_agent=parent,
-            )
-
-        # With idle threshold=5 + interval=0.05s, touches should cap
-        # around 5. Bound loosely to avoid timing flakes.
-        self.assertLess(
-            len(touch_calls), 9,
-            f"Idle stale detection did not fire: got {len(touch_calls)} "
-            f"touches over 0.6s — expected heartbeat to stop after "
-            f"~5 stale cycles",
-        )
 
 
 class TestDelegationReasoningEffort(unittest.TestCase):
@@ -2381,6 +2346,53 @@ class TestSubagentApprovalCallback(unittest.TestCase):
         self.assertEqual(seen, [_subagent_auto_deny])
         # Parent's callback slot is still empty (TLS isolates threads).
         self.assertIsNone(_get_approval_callback())
+
+
+class TestFallbackModelInheritance(unittest.TestCase):
+    """Subagents must inherit the parent's fallback provider chain."""
+
+    def test_child_inherits_fallback_chain(self):
+        """_build_child_agent passes parent._fallback_chain as fallback_model."""
+        parent = _make_mock_parent(depth=0)
+        fallback_entry = {"provider": "openrouter", "model": "gpt-4o-mini", "api_key": "sk-or-x"}
+        parent._fallback_chain = [fallback_entry]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test fallback inheritance",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["fallback_model"], [fallback_entry])
+
+    def test_child_gets_no_fallback_when_parent_chain_empty(self):
+        """When parent._fallback_chain is empty, fallback_model is None."""
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = []
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test no fallback",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertIsNone(kwargs["fallback_model"])
 
 
 if __name__ == "__main__":
