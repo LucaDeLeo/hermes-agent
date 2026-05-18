@@ -28,12 +28,42 @@ logger = logging.getLogger(__name__)
 # Derived from toolsets._HERMES_CORE_TOOLS minus Claude Code equivalents.
 # ---------------------------------------------------------------------------
 
-_CLAUDE_CODE_BUILTINS = frozenset({
-    "read_file", "write_file", "patch", "search_files",  # Read/Write/Edit/Glob/Grep
-    "terminal", "process",                                 # Bash
-    "web_search", "web_extract",                           # WebSearch/WebFetch
-    "clarify",                                             # requires interactive TUI callback
-})
+# Maps each Claude Code built-in tool to the Hermes tool name(s) that must
+# be enabled for it to remain in the SDK's allowed_tools list. Source of
+# truth for both directions — _CLAUDE_CODE_BUILTINS below is derived.
+_BUILTIN_TO_HERMES: Dict[str, frozenset] = {
+    "Read":      frozenset({"read_file"}),
+    "Write":     frozenset({"write_file"}),
+    "Edit":      frozenset({"patch"}),
+    "Glob":      frozenset({"search_files"}),
+    "Grep":      frozenset({"search_files"}),
+    "Bash":      frozenset({"terminal", "process"}),
+    "WebSearch": frozenset({"web_search"}),
+    "WebFetch":  frozenset({"web_extract"}),
+}
+
+# Hermes tools NOT exposed via MCP because Claude Code already serves them
+# (via _BUILTIN_TO_HERMES) or requires a TUI callback we don't bridge (clarify).
+_CLAUDE_CODE_BUILTINS = (
+    frozenset().union(*_BUILTIN_TO_HERMES.values()) | {"clarify"}
+)
+
+
+def filter_claude_builtins(valid_tool_names) -> list:
+    """Return the built-in tool names that should be exposed to Claude Code.
+
+    A built-in is allowed iff at least one of its Hermes equivalents is in
+    *valid_tool_names*. If *valid_tool_names* is None or empty, returns the
+    full built-in set (the un-filtered default that pre-2026-05 code shipped).
+    """
+    if not valid_tool_names:
+        return list(_BUILTIN_TO_HERMES.keys())
+    enabled = set(valid_tool_names)
+    return [
+        builtin
+        for builtin, mapped in _BUILTIN_TO_HERMES.items()
+        if mapped & enabled
+    ]
 
 
 def _build_hermes_mcp_tools() -> frozenset:
@@ -50,6 +80,18 @@ def _get_hermes_mcp_tools() -> frozenset:
     if _hermes_mcp_tools is None:
         _hermes_mcp_tools = _build_hermes_mcp_tools()
     return _hermes_mcp_tools
+
+
+def _filter_mcp_tools(enabled_tools) -> frozenset:
+    """Return MCP-exposable tools intersected with *enabled_tools*.
+
+    *enabled_tools* may be a set/list/tuple of tool names, or None. None
+    keeps every Hermes-unique tool exposed (matches the legacy behaviour).
+    """
+    universe = _get_hermes_mcp_tools()
+    if not enabled_tools:
+        return universe
+    return universe & frozenset(enabled_tools)
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +136,11 @@ def create_hermes_tools_server(context: dict):
     import model_tools  # noqa: F401
     from tools.registry import registry
 
-    hermes_tools = _get_hermes_mcp_tools()
+    # When context["enabled_tools"] is populated (set by AIAgent._create_harness
+    # from self.valid_tool_names), restrict the MCP surface to that intersection.
+    # Falling back to the full Hermes-unique universe preserves test-harness
+    # callers that build the server without an agent.
+    hermes_tools = _filter_mcp_tools(context.get("enabled_tools"))
     mcp_tools: list = []
     exposed: list = []
 

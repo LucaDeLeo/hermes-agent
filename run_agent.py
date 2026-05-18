@@ -310,10 +310,16 @@ def _flatten_message_text(content: Any) -> str:
     return str(content) if content is not None else ""
 
 
+# Defaults used by both the prelude builder and the AIAgent init shim
+# that exposes them as overridable attributes.
+_HARNESS_PRELUDE_MAX_CHARS = 120_000
+_HARNESS_PRELUDE_TAIL_TURNS = 10
+
+
 def _build_harness_history_prelude(
     messages: list,
-    max_chars: int = 120_000,
-    tail_turns: int = 10,
+    max_chars: int = _HARNESS_PRELUDE_MAX_CHARS,
+    tail_turns: int = _HARNESS_PRELUDE_TAIL_TURNS,
 ) -> tuple[str, dict]:
     """Build a plain-text prelude summarising prior conversation turns.
 
@@ -582,9 +588,10 @@ class AIAgent:
             pass_session_id=pass_session_id,
         )
 
-        # Fork-only: harness wiring + persist_session.
-        # agent_init.init_agent() does not touch any of these attributes.
+        # Fork-only attributes that upstream's init_agent() doesn't set.
+        # thinking_delta_callback is consumed by the Claude Code harness.
         self.persist_session = persist_session
+        self.thinking_delta_callback = thinking_delta_callback
         self._harness_override = (
             (harness or "").strip().lower() or None
         )
@@ -592,6 +599,8 @@ class AIAgent:
         self._harness_messages: list = []
         self._harness_sdk_session_id: Optional[str] = None
         self._harness_resume_known_dead: bool = False
+        self._harness_prelude_max_chars: int = _HARNESS_PRELUDE_MAX_CHARS
+        self._harness_prelude_tail_turns: int = _HARNESS_PRELUDE_TAIL_TURNS
         # _is_native_anthropic_for_harness mirrors the same condition agent_init.py
         # uses to decide whether to build the Anthropic-native client.
         self._is_native_anthropic_for_harness = (
@@ -2212,11 +2221,17 @@ class AIAgent:
         except Exception as exc:
             logger.warning("Failed to build Hermes MCP tools server: %s", exc, exc_info=True)
 
+        # Filter Claude Code's built-in surface so disabling `terminal` /
+        # `file` / `web` in Hermes also drops Bash / Read+Write / WebSearch.
+        from tools.mcp_tools_server import filter_claude_builtins
+        _allowed_builtins = filter_claude_builtins(self.valid_tool_names)
+
         session = ClaudeAgentSession(
             model=self.model,
             cwd=self._resolve_harness_cwd(),
             permission_mode="acceptEdits",
             max_turns=self.max_iterations,
+            allowed_tools=_allowed_builtins,
             resume_session_id=self._harness_sdk_session_id,
             mcp_server_config=mcp_server_config,
             on_session_captured=self._on_harness_sdk_session_captured,
@@ -4173,6 +4188,7 @@ class AIAgent:
         self,
         user_message: str,
         original_user_message: str = "",
+        system_message: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run a conversation turn via the Claude Agent SDK.
 
@@ -4188,18 +4204,30 @@ class AIAgent:
         prior turns into ``user_message`` so the model still sees context.
         ``original_user_message`` is never prelude-wrapped so persisted
         history, trajectories, and hooks stay clean.
+
+        When *system_message* is provided it is prepended verbatim to the
+        Claude Code system prompt so callers passing
+        ``run_conversation(..., system_message=...)`` see the same effect
+        as on non-harness transports.
         """
         # Pass only the lightweight context (SOUL.md, AGENTS.md, memory,
         # user profile) — not the full Hermes system prompt which includes
         # tool guidance and skills listings that Claude Code already handles.
         _ctx_parts = []
-        try:
-            from agent.prompt_builder import build_context_files_prompt
-            _ctx = build_context_files_prompt(cwd=os.getcwd())
-            if _ctx:
-                _ctx_parts.append(_ctx)
-        except Exception:
-            pass
+        if system_message:
+            _ctx_parts.append(system_message)
+        # Mirror agent/system_prompt.py:225-232 — honour skip_context_files
+        # and use TERMINAL_CWD so gateway sessions don't pick up the install
+        # dir's AGENTS.md (~10k tokens of dev files for no benefit).
+        if not self.skip_context_files:
+            try:
+                from agent.prompt_builder import build_context_files_prompt
+                _ctx_cwd = os.getenv("TERMINAL_CWD") or None
+                _ctx = build_context_files_prompt(cwd=_ctx_cwd)
+                if _ctx:
+                    _ctx_parts.append(_ctx)
+            except Exception:
+                pass
         if self._memory_store:
             for section in ("memory", "user"):
                 try:
@@ -4278,10 +4306,66 @@ class AIAgent:
             except Exception as exc:
                 logger.warning("post_llm_call hook failed: %s", exc)
 
-        self.clear_interrupt()
+        # End-of-turn lifecycle parity with agent/conversation_loop.py.
+        # A /steer landed after the final assistant turn has no tool batch
+        # to drain into — surface it so the caller can deliver it next turn.
+        _leftover_steer = self._drain_pending_steer()
+        if _leftover_steer:
+            result["pending_steer"] = _leftover_steer
 
-        # Override adapter's single-turn messages with the cumulative list
-        # so CLI/gateway callers get the full conversation history.
+        if interrupted and self._interrupt_message:
+            result["interrupt_message"] = self._interrupt_message
+
+        self.clear_interrupt()
+        self._stream_callback = None
+
+        # Memory nudge — mirrors conversation_loop.py:387-394 guards.
+        # Skill nudge is intentionally skipped: Claude Code owns the tool loop,
+        # so Hermes never increments _iters_since_skill — firing on a zero
+        # counter would re-trigger every turn.
+        _should_review_memory = (
+            self._memory_nudge_interval > 0
+            and "memory" in self.valid_tool_names
+            and self._memory_store
+            and self._turns_since_memory >= self._memory_nudge_interval
+        )
+        if _should_review_memory:
+            self._turns_since_memory = 0
+
+        try:
+            self._sync_external_memory_for_turn(
+                original_user_message=original_user_message or user_message,
+                final_response=final_response,
+                interrupted=interrupted,
+            )
+        except Exception as exc:
+            logger.debug("harness external-memory sync failed: %s", exc)
+
+        if final_response and not interrupted and _should_review_memory:
+            try:
+                self._spawn_background_review(
+                    messages_snapshot=list(self._harness_messages),
+                    review_memory=True,
+                    review_skills=False,
+                )
+            except Exception:
+                pass
+
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_end",
+                session_id=self.session_id,
+                completed=completed,
+                interrupted=interrupted,
+                model=self.model,
+                platform=getattr(self, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_end hook failed: %s", exc)
+
+        # Cumulative messages override adapter's single-turn list so callers
+        # see full conversation history.
         result["messages"] = list(self._harness_messages)
         return result
 
@@ -4432,6 +4516,7 @@ class AIAgent:
             return self._run_claude_code_conversation(
                 user_message=_effective_user_msg,
                 original_user_message=original_user_message,
+                system_message=system_message,
             )
         # Default path: upstream's extracted run_conversation.
         from agent.conversation_loop import run_conversation as _run_conversation

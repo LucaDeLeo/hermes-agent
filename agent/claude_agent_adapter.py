@@ -62,6 +62,16 @@ def _run_sync(coro):
     return future.result()
 
 
+def _safe_call(cb, *args, label: str, **kwargs) -> None:
+    """Invoke *cb*; log+swallow exceptions to match the tool_executor contract."""
+    if cb is None:
+        return
+    try:
+        cb(*args, **kwargs)
+    except Exception as exc:
+        logger.debug("Claude adapter callback %s raised: %s", label, exc)
+
+
 class ClaudeAgentSession:
     """Wraps Claude Agent SDK ``query()`` for use inside Hermes's sync agent.
 
@@ -252,12 +262,12 @@ class ClaudeAgentSession:
                             text = delta.get("text") or ""
                             if text and stream_delta_callback:
                                 saw_text_delta = True
-                                stream_delta_callback(text)
+                                _safe_call(stream_delta_callback, text, label="stream_delta")
                         elif dtype == "thinking_delta":
                             thinking = delta.get("thinking") or ""
                             if thinking and thinking_delta_callback:
                                 saw_thinking_delta = True
-                                thinking_delta_callback(thinking)
+                                _safe_call(thinking_delta_callback, thinking, label="thinking_delta")
 
                 elif isinstance(message, AssistantMessage):
                     api_calls += 1
@@ -265,24 +275,24 @@ class ClaudeAgentSession:
                         if isinstance(block, TextBlock):
                             final_text_parts.append(block.text)
                             if stream_delta_callback and not saw_text_delta:
-                                stream_delta_callback(block.text)
+                                _safe_call(stream_delta_callback, block.text, label="stream_delta")
 
                         elif isinstance(block, ThinkingBlock):
                             last_reasoning = block.thinking
                             if thinking_callback and not saw_thinking_delta:
-                                thinking_callback(block.thinking)
+                                _safe_call(thinking_callback, block.thinking, label="thinking")
 
                         elif isinstance(block, ToolUseBlock):
                             in_flight_tools[block.id] = (block.name, block.input or {})
                             if tool_progress_callback:
                                 preview = str(block.input)[:120] if block.input else ""
-                                tool_progress_callback("tool.started", block.name, preview, block.input, tool_call_id=block.id)
+                                _safe_call(tool_progress_callback, "tool.started", block.name, preview, block.input, label="tool_progress_start", tool_call_id=block.id)
 
                         elif isinstance(block, ToolResultBlock):
                             if tool_complete_callback:
                                 name, args = in_flight_tools.pop(block.tool_use_id, ("", {}))
                                 result_str = block.content if isinstance(block.content, str) else str(block.content)
-                                tool_complete_callback(block.tool_use_id, name, args, result_str)
+                                _safe_call(tool_complete_callback, block.tool_use_id, name, args, result_str, label="tool_complete")
 
                 elif isinstance(message, UserMessage):
                     # Tool results come as UserMessage in the Claude Code
@@ -293,7 +303,7 @@ class ClaudeAgentSession:
                                 if tool_complete_callback:
                                     name, args = in_flight_tools.pop(block.tool_use_id, ("", {}))
                                     result_str = block.content if isinstance(block.content, str) else str(block.content)
-                                    tool_complete_callback(block.tool_use_id, name, args, result_str)
+                                    _safe_call(tool_complete_callback, block.tool_use_id, name, args, result_str, label="tool_complete")
 
                 elif isinstance(message, ResultMessage):
                     result_msg = message
