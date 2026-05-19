@@ -83,6 +83,64 @@ class TestHostHeaderValidator:
         assert _is_accepted_host("LOCALHOST", "127.0.0.1")
         assert _is_accepted_host("LocalHost:9119", "127.0.0.1")
 
+    def test_trusted_extra_hosts_accepted_on_loopback(self, monkeypatch):
+        """HERMES_DASHBOARD_TRUSTED_HOSTS lets a reverse proxy (tailscale
+        serve, Caddy) front a loopback-bound dashboard with its own
+        hostname without the operator dropping to --insecure."""
+        from hermes_cli.web_server import _is_accepted_host
+
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_TRUSTED_HOSTS",
+            "lucas-macbook-pro.tailb58fdf.ts.net,lucas-macbook-pro",
+        )
+        for host in (
+            "lucas-macbook-pro",
+            "lucas-macbook-pro:9119",
+            "lucas-macbook-pro.tailb58fdf.ts.net",
+            "lucas-macbook-pro.tailb58fdf.ts.net:443",
+            "LUCAS-MACBOOK-PRO",  # case-insensitive
+        ):
+            assert _is_accepted_host(host, "127.0.0.1"), (
+                f"trusted host {host!r} must be accepted on loopback bind"
+            )
+
+    def test_trusted_hosts_do_not_widen_attacker_surface(self, monkeypatch):
+        """The env var is an explicit allowlist — hostnames outside it
+        are still rejected, including ones that resemble the trusted host."""
+        from hermes_cli.web_server import _is_accepted_host
+
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_TRUSTED_HOSTS",
+            "lucas-macbook-pro.tailb58fdf.ts.net",
+        )
+        for attacker in (
+            "evil.example",
+            "lucas-macbook-pro.evil.test",
+            "lucas-macbook-pro.tailb58fdf.ts.net.attacker.test",
+            "fake-lucas-macbook-pro.tailb58fdf.ts.net",
+        ):
+            assert not _is_accepted_host(attacker, "127.0.0.1"), (
+                f"non-allowlisted host {attacker!r} must be rejected"
+            )
+
+    def test_trusted_hosts_unset_keeps_legacy_behaviour(self, monkeypatch):
+        """No env var → loopback bind still only accepts loopback names."""
+        from hermes_cli.web_server import _is_accepted_host
+
+        monkeypatch.delenv("HERMES_DASHBOARD_TRUSTED_HOSTS", raising=False)
+        assert _is_accepted_host("localhost", "127.0.0.1")
+        assert not _is_accepted_host("lucas-macbook-pro", "127.0.0.1")
+
+    def test_trusted_hosts_csv_whitespace_tolerated(self, monkeypatch):
+        from hermes_cli.web_server import _is_accepted_host
+
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_TRUSTED_HOSTS",
+            "  host-a  , host-b ,,host-c",
+        )
+        for host in ("host-a", "host-b", "host-c"):
+            assert _is_accepted_host(host, "127.0.0.1")
+
 
 class TestHostHeaderMiddleware:
     """End-to-end test via the FastAPI app — verify the middleware

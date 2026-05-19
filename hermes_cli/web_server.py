@@ -159,6 +159,20 @@ _LOOPBACK_HOST_VALUES: frozenset = frozenset({
 })
 
 
+def _trusted_extra_hosts() -> frozenset:
+    """Extra hostnames accepted in the Host: header when bound to loopback.
+
+    Reads ``HERMES_DASHBOARD_TRUSTED_HOSTS`` (comma-separated). The use case
+    is fronting a loopback-bound dashboard with a TLS reverse proxy on the
+    same machine (tailscale serve, Caddy, nginx) so the dashboard stays off
+    the network without needing ``--insecure``. The proxy provides the
+    network trust boundary; this env var just tells the host-header guard
+    which hostnames the proxy will arrive with.
+    """
+    raw = os.environ.get("HERMES_DASHBOARD_TRUSTED_HOSTS", "")
+    return frozenset(h.strip().lower() for h in raw.split(",") if h.strip())
+
+
 def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     """True if the Host header targets the interface we bound to.
 
@@ -194,10 +208,12 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     if bound_host in {"0.0.0.0", "::"}:
         return True
 
-    # Loopback bind: accept the loopback names
+    # Loopback bind: accept the loopback names plus operator-trusted hosts.
     bound_lc = bound_host.lower()
     if bound_lc in _LOOPBACK_HOST_VALUES:
-        return host_only in _LOOPBACK_HOST_VALUES
+        if host_only in _LOOPBACK_HOST_VALUES:
+            return True
+        return host_only in _trusted_extra_hosts()
 
     # Explicit non-loopback bind: require exact host match
     return host_only == bound_lc
