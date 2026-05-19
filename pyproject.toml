@@ -126,6 +126,7 @@ claude-agent = ["claude-agent-sdk>=0.0.25,<1"]
 #   4. Run `uv lock` to regenerate transitives.
 #   5. Optionally re-add to [all] only after a few days of clean operation.
 bedrock = ["boto3==1.42.89"]
+azure-identity = ["azure-identity==1.25.3"]
 termux = [
   # Baseline Android / Termux path for reliable fresh installs.
   "python-telegram-bot[webhooks]==22.6",
@@ -217,6 +218,11 @@ py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajector
 [tool.setuptools.package-data]
 hermes_cli = ["web_dist/**/*", "tui_dist/**/*", "scripts/install.sh", "scripts/install.ps1"]
 gateway = ["assets/**/*"]
+plugins = [
+  "*/dashboard/manifest.json",
+  "*/dashboard/dist/*",
+  "*/dashboard/dist/**/*",
+]
 
 [tool.setuptools.packages.find]
 include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*"]
