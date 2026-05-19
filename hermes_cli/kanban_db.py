@@ -865,7 +865,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     session_id           TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id);
+-- idx_tasks_session_id is created by _migrate_add_optional_columns so the
+-- order works on existing DBs where session_id is added by ALTER TABLE after
+-- this script's CREATE TABLE IF NOT EXISTS no-ops on the legacy schema.
 
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
@@ -1170,14 +1172,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # created from within an agent loop that propagated
         # ``HERMES_SESSION_ID`` (e.g. ACP). NULL on legacy rows and on any
         # creation path that doesn't set the env var (CLI, dashboard).
-        # Index keeps per-session list queries cheap.
         _add_column_if_missing(
             conn, "tasks", "session_id", "session_id TEXT"
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_tasks_session_id "
-            "ON tasks(session_id)"
-        )
+    # Index keeps per-session list queries cheap. Lifted out of the
+    # column-add branch so fresh DBs (where SCHEMA_SQL already created the
+    # column) also get the index — idx_tasks_session_id was removed from
+    # SCHEMA_SQL because its CREATE INDEX raced ahead of the ALTER TABLE on
+    # legacy DBs that pre-date the session_id column.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_session_id "
+        "ON tasks(session_id)"
+    )
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
